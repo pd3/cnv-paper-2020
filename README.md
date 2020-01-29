@@ -1,1 +1,1 @@
-# cnv-paper-2020
+This is a collection of scripts and pipelines used for the paper XY. Note that this repository is only intended for inspiration and transparency. It is NOT complete, it is NOT maintained, it is NOT supported.
