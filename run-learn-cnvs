@@ -1,0 +1,1373 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use TabixCache;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{blind_evaluation} = 1;   # by default remove DECIPHER calls from training, even if they appear in the training set
+    $$self{verbose}  = 1;
+    $$self{nbatch}   = 10_000;     # number of CNVs per batch .. breakpoints: 50k ~ 4hrs 
+    $$self{fa_ref}   = 'hs37d5.fa';
+    $$self{mappable} = 'callable/wgEncodeCrgMapabilityAlign75mer.bed.gz';    # see clamms/ChangeLog
+    $$self{training} = 'curated.paper/curated.training.txt.gz';
+    $$self{samples}  = 'bams-baits-smpl-sex.nodup.txt';     # bam,bait,smpl,sex  (sex is unused)
+    $$self{callers}  =
+    [
+        { 
+            name  => 'clamms',
+            calls => './clamms/raw.txt.gz',                     # first line must be a header with column names, starting with '#'
+            keys  => [qw(type chr beg end sample Q_SOME)],      # the header keys which define the CNV type (DUP or DEL), chromosome, beg, end, sample ID, quality score
+        },
+        {
+            name  => 'convex',
+            calls => './convex/raw.txt.gz',
+            keys  => [qw(cnv_type chr start end sample_id convex_score)],
+        },
+        {
+            name  => 'xhmm',
+            calls => './xhmm/raw.txt.gz',
+            keys  => [qw(CNV CHR start end SAMPLE Q_SOME)],
+        },
+        {
+            name  => 'canoes',
+            calls => './canoes/raw.txt.gz',
+            keys  => [qw(TYPE CHR BEG END SAMPLE Q_SOME)],
+        },
+    ];
+    $$self{nprobes_extend} = 20;    # number of probes to investigate in flanking regions
+    $$self{random_forest}  = 'random-forest.py -n 150';
+    $$self{annot_regs}     = 'annot-regs';
+    $$self{trio_samples}   = 'ddd-samples.ped';
+    $$self{decipher_del}   = 'decipher/decipher.del.txt.gz';
+    $$self{decipher_dup}   = 'decipher/decipher.dup.txt.gz';
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-learn-cnvs\n" .
+        "Options:\n" .
+        "   -c, --compare <dir>         Compare the RF scores to the previous run\n" .
+        "   -d, --debug region list     Run only for this region and these samples\n" .
+        "       --no-blind-eval         Include DECIPHER calls if part of training set. (This will make impossible to assess real performance.)\n" .
+        "   -o, --outdir <dir>          Output directory\n" .
+        "   -t, --training <file>       e.g. curated.v2019-02-28/curated.training.txt.gz\n" .
+        "   -u, --update-curated        Run again with updated training set\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    my @dirs = ();
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if (                 $arg eq '--no-blind-eval' ) { $$self{blind_evaluation}=0; next; }
+        if ( $arg eq '-c' or $arg eq '--compare' ) { $$self{compare_dir}=shift(@ARGV); next; }
+        if ( $arg eq '-t' or $arg eq '--training' ) { $$self{training}=shift(@ARGV); next; }
+        if ( $arg eq '-d' or $arg eq '--debug' ) { $$self{debug_region}=shift(@ARGV); $$self{debug_samples}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        if ( $arg eq '-u' or $arg eq '--update-curated' ) { $$self{update_curated}=1; next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    # Create a list of candidate CNVs from all callers.
+    # The output format is:
+    #   - sample, chr, beg, end, caller
+    $self->spawn('create_candidates',"$$self{outdir}/candidates");
+    $self->wait;
+
+    $self->spawn('mark_de_novos',"$$self{outdir}/dnm-candidates","$$self{outdir}/candidates/candidates.txt.gz");
+    $self->wait;
+
+    # Initialize batches for parallel processing
+    my $batches = $self->read_batches("$$self{outdir}/candidates");
+
+    # Prepare bait regions, sample lookup tables, GC content:
+    #   - bait2bait
+    #   - smpl2info
+    #   - bait2gc
+    $self->init_tables();
+
+    # Consolidate breakpoints
+    for my $batch (@$batches)
+    {
+        $$batch{breakpoints} = "$$self{outdir}/breakpoints/batch.$$batch{num}.txt.gz";
+        $self->spawn('resolve_breakpoints',$$batch{breakpoints},$batch);
+    }
+    $self->wait;
+
+    # Add filtering features
+    $self->set_limits(memory=>2_000);
+    for my $batch (@$batches)
+    {
+        $$batch{features} = "$$self{outdir}/features/batch.$$batch{num}.txt.gz";
+        $self->spawn('add_features',$$batch{features},$batch);
+    }
+    $self->wait;
+    $self->set_limits(memory=>undef);
+
+    $self->spawn('merge_batches',"$$self{outdir}/features.txt.gz",$batches,'features');
+    $self->wait;
+
+    # mark potential de-novos - 8hrs, 1GB
+    # Note: this code was commented out for some reason, but the results are needed further. Probably intended to use the dnm-candidates above but did not finish?
+    $self->spawn('mark_de_novos_ori',"$$self{outdir}/de-novos/DEL.txt.gz","$$self{outdir}/candidates/candidates.txt.gz","$$self{outdir}/features.txt.gz",'DEL');
+    $self->spawn('mark_de_novos_ori',"$$self{outdir}/de-novos/DUP.txt.gz","$$self{outdir}/candidates/candidates.txt.gz","$$self{outdir}/features.txt.gz",'DUP');
+    $self->wait;
+
+    if ( $$self{update_curated} )
+    {
+        $self->cmd("rm -rf $$self{outdir}/.jobs");
+        $self->cmd("rm -rf $$self{outdir}/DEL.txt.gz $$self{outdir}/DUP.txt.gz $$self{outdir}/for-curation");
+        $self->cmd("rm -rf $$self{outdir}/random-forest $$self{outdir}/for-curation $$self{outdir}/for-filtering");
+        $self->spawn('update_curated',"$$self{outdir}/features.updated.txt.gz","$$self{outdir}/features.txt.gz");
+        $self->wait;
+
+        rename("$$self{outdir}/features.updated.txt.gz","$$self{outdir}/features.txt.gz") or $self->throw("rename $$self{outdir}/features.updated.txt.gz $$self{outdir}/features.txt.gz: $!");
+        $self->all_done;
+    }
+
+    # Unset TP flags from DECIPHER calls so that they are not used in training. We want to see real performance.
+    $self->spawn('mark_decipher',"$$self{outdir}/for-filtering/DEL.txt.gz","$$self{outdir}/de-novos/DEL.txt.gz",$$self{decipher_del});
+    $self->spawn('mark_decipher',"$$self{outdir}/for-filtering/DUP.txt.gz","$$self{outdir}/de-novos/DUP.txt.gz",$$self{decipher_dup});
+    $self->wait;
+
+    $self->set_limits(memory=>10_000);
+    $self->spawn('random_forest',"$$self{outdir}/random-forest/DEL.txt.gz","$$self{outdir}/for-filtering/DEL.txt.gz");
+    $self->spawn('random_forest',"$$self{outdir}/random-forest/DUP.txt.gz","$$self{outdir}/for-filtering/DUP.txt.gz");
+    $self->wait;
+    $self->set_limits(memory=>undef);
+
+    if ( exists($$self{compare_dir}) )
+    {
+        $self->spawn('compare_scores',"$$self{outdir}/compare-scores/DEL.txt.gz","$$self{compare_dir}/random-forest/DEL.txt.gz","$$self{outdir}/random-forest/DEL.txt.gz");
+        $self->spawn('compare_scores',"$$self{outdir}/compare-scores/DUP.txt.gz","$$self{compare_dir}/random-forest/DUP.txt.gz","$$self{outdir}/random-forest/DUP.txt.gz");
+        $self->wait;
+    }
+
+    $self->spawn('plot_features',"$$self{outdir}/importances","$$self{outdir}/random-forest/DUP.txt.gz.log","$$self{outdir}/random-forest/DEL.txt.gz.log");
+    $self->spawn('plot_scores',"$$self{outdir}/sfig-RF-scores-distrib.dup.png","$$self{outdir}/random-forest/DUP.txt.gz",q[+fc "#007ab9" +title 'Random forest score distribution (DUPs)']);
+    $self->spawn('plot_scores',"$$self{outdir}/sfig-RF-scores-distrib.del.png","$$self{outdir}/random-forest/DEL.txt.gz",q[+fc "#f4640d" +title 'Random forest score distribution (DELs)']);
+    $self->wait;
+
+    # add some minor annotations and sort
+    $self->spawn('sort_for_curation',"$$self{outdir}/for-curation/DEL.txt.gz","$$self{outdir}/random-forest/DEL.txt.gz");
+    $self->spawn('sort_for_curation',"$$self{outdir}/for-curation/DUP.txt.gz","$$self{outdir}/random-forest/DUP.txt.gz");
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub plot_features
+{
+    my ($self,$outdir,@datfiles) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+    for my $datfile (@datfiles)
+    {
+        if ( !($datfile=~m{/([^/]+)\.txt\.gz\.log$}) ) { $self->throw("Could not parse: $datfile"); }
+        my $type = $1;
+        #my $color = $type eq 'DUP' ? qq[+fc '#2E6DA4'] : qq[+fc '#D43F3A'];
+        my $color = $type eq 'DUP' ? qq[+fc '#007ab9'] : qq[+fc '#f4640d'];
+
+        chomp(my $nimp = ($self->cmd("cat $datfile | grep ^IMP | wc -l"))[0]);
+        my $h = int($nimp/3);
+        my $cmd = "cat $datfile | grep ^IMP | cut -f 3- | sort -k2,2gr";
+        my $uctype = uc($type);
+        $self->cmd(qq[$cmd | mplot barplot -F -o $dir/importance.$type.png,pdf,svgz $color +title 'Random Forest features ($uctype)' +xl 'Importance' +wh 7,$h +type ylbl-cnt +sty mine +wd 0.8 +adj left=0.23,bottom=0.12,top=0.85,right=0.99 +hdt 1]);
+    }
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub mark_decipher
+{
+    my ($self,$outfile,$dstfile,$srcfile) = @_;
+    my ($cols,$itp_fp) = $self->col_names($dstfile,'tp/fp');
+    my $cmd = qq[$$self{annot_regs} -s $srcfile -d $dstfile -c chr,beg,end:chr,beg,end -m smpl:smpl -t smpl:decipher];
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { print $out $line; next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[-1] eq '.' ) { print $out $line; next; }
+        $col[-1] = '1';
+        if ( $$self{blind_evaluation} ) { $col[$itp_fp] = '.'; }    # don't use in training unless explicitly told so
+        print $out join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub parse_ped
+{
+    my ($self,$file) = @_;
+    my %ped = ();
+    open(my $in,'<',$file) or $self->throw("$file: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\s+/,$line);
+        chomp($col[-1]);
+        $ped{$col[1]}{father} = $col[2];
+        $ped{$col[1]}{mother} = $col[3];
+        if ( $col[2] ne '0' && $col[3] ne '0' )
+        {
+            $$self{parent2smpl}{$col[2]}{$col[1]} = 1;
+            $$self{parent2smpl}{$col[3]}{$col[1]} = 1;
+            $$self{trio_smpl}{$col[1]} = 1;
+        }
+    }
+    close($in) or $self->throw("close failed: $file");
+    return \%ped;
+}
+# The intention was to make this obsolete for some reason, but apparently was not finished.
+sub mark_de_novos_ori
+{
+    my ($self,$outfile,$srcfile,$dstfile,$type) = @_;
+
+    my $trio = $self->parse_ped($$self{trio_samples});
+    my $data_smpl = { map { $_ => 1 } grep { chomp } $self->cmd("cat $$self{samples} | cut -f3") };
+
+    my $cols;
+    my $ismpl = 0;
+    my $ichr  = 1;
+    my $ibeg  = 2;
+    my $iend  = 3;
+    my $itype = 4;
+    open(my $in,"gunzip -c $srcfile |") or $self->throw("gunzip -c $srcfile: $!");
+    open(my $out,"| gzip -c > $outfile.src") or $self->throw("gzip -c > $outfile.src: $!");
+    print $out '#'.join("\t",qw(smpl chr beg end))."\n";
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[$itype] ne $type ) { next; }
+        print $out join("\t",$col[$ismpl],$col[$ichr],$col[$ibeg],$col[$iend])."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $srcfile");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.src");
+
+    ($cols,$ismpl,$ichr,$ibeg,$iend,$itype) = $self->col_names($dstfile,qw(smpl chr beg end type));
+    open($in,"gunzip -c $dstfile |") or $self->throw("gunzip -c $dstfile: $!");
+    open($out,"| gzip -c > $outfile.dst") or $self->throw("gzip -c > $outfile.dst: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ )
+        {
+            print $out $line;
+            next;
+        }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[$itype] ne $type ) { next; }
+        print $out $line;
+    }
+    close($in) or $self->throw("close failed: gunzip -c $dstfile");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.dst");
+
+    ($cols,$ismpl) = $self->col_names("$outfile.dst",qw(smpl chr beg end type));
+    my $cmd = qq[$$self{annot_regs} -s $outfile.src -d $outfile.dst -c chr,beg,end:chr,beg,end -t smpl:overlap];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    open($out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        my @col  = split(/\t/,$line);
+        my $olap = pop(@col);
+        if ( $line=~/^#/ )
+        {
+            print $out join("\t",@col,'AF','trio_proband','DNM')."\n";
+            next;
+        }
+        chomp($col[-1]);
+        my $smpl = $col[$ismpl];
+
+        my $is_trio_proband = 1;
+        if ( !exists($$trio{$smpl}) ) { $is_trio_proband = 0; }
+        elsif ( !exists($$trio{$smpl}{father}) ) { $is_trio_proband = 0; }
+        elsif ( !exists($$trio{$smpl}{mother}) ) { $is_trio_proband = 0; }
+        elsif ( !exists($$data_smpl{$smpl}) ) { $is_trio_proband = 0; }
+        elsif ( !exists($$data_smpl{$$trio{$smpl}{father}}) ) { $is_trio_proband = 0; }
+        elsif ( !exists($$data_smpl{$$trio{$smpl}{mother}}) ) { $is_trio_proband = 0; }
+
+        my @olap = split(/,/,$olap);
+        my $af = scalar @olap;
+
+        my $is_dnm = $is_trio_proband ? 1 : 0;
+        if ( $is_trio_proband )
+        {
+            for my $id (@olap)
+            {
+                if ( $id eq $smpl ) { next; }
+                if ( $id eq $$trio{$smpl}{father} or $id eq $$trio{$smpl}{mother} ) { $is_dnm = 0; last; }
+            }
+        }
+        print $out join("\t",@col,$af,$is_trio_proband,$is_dnm)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+
+    unlink("$outfile.src");
+    unlink("$outfile.dst");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub mark_de_novos
+{
+    my ($self,$outdir,$infile) = @_;
+
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my $trio = $self->parse_ped($$self{trio_samples});
+
+    # the columns are: smpl,chr,beg,end,type,qual,caller
+    open(my $in,"gunzip -c $infile |") or $self->throw("gunzip -c $infile: $!");
+    open(my $out_src,"| gzip -c > $dir/tmp.src.gz") or $self->throw("gzip -c > $dir/tmp.src.gz: $!");
+    open(my $out_dst,"| gzip -c > $dir/tmp.dst.gz") or $self->throw("gzip -c > $dir/tmp.dst.gz: $!");
+    print $out_src '#'.join("\t",qw(smpl chr beg end type qual caller))."\n";
+    print $out_dst '#'.join("\t",qw(smpl chr beg end type qual caller))."\n";
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { $self->throw("Did not expect this: $infile .. $line"); }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $smpl = $col[0];
+
+        if ( exists($$self{parent2smpl}{$smpl}) )
+        {
+            for my $child (keys %{$$self{parent2smpl}{$smpl}}) # src has the parent replaced by the child
+            {
+                $col[0] = $child;
+                print $out_src join("\t",@col)."\n";
+            }
+        }
+        if ( exists($$self{trio_smpl}{$smpl}) )
+        {
+            print $out_dst $line;                       # dst stays as is
+        }
+    }
+    close($in) or $self->throw("close failed: gunzip -c $infile");
+    close($out_src) or $self->throw("close failed: gzip -c > $dir/tmp.src.gz");
+    close($out_dst) or $self->throw("close failed: gzip -c > $dir/tmp.dst.gz");
+
+    my $cmd = qq[$$self{annot_regs} -s $dir/tmp.src.gz -d $dir/tmp.dst.gz -c chr,beg,end:chr,beg,end -m type,smpl:type,smpl -t inherited];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    open(my $out,"| gzip -c > $dir/candidates.dnm.txt.gz") or $self->throw("gzip -c > $dir/candidates.dnm.txt.gz: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $line=~/^#/ )
+        {
+            print $out join("\t",@col,'DNM')."\n";
+            next;
+        }
+        my $dnm = $col[-1] eq '.' ? 1 : 0;
+        print $out join("\t",@col,$dnm)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: gzip -c > $dir/candidates.dnm.txt.gz");
+
+    rename($dir,$outdir) or $self->throw("rename $dir $outdir: $!");
+}
+
+sub update_curated
+{
+    my ($self,$outfile,$infile) = @_;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{training} -d $infile -c chr,beg,end:chr,beg,end -m type,sample:type,smpl -t tp/fp:tp/fp | gzip -c > $outfile.part]);
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub sort_for_curation
+{
+    my ($self,$outfile,$infile) = @_;
+    my ($cols,$ichr,$ibeg,$iend,$ismpl,$is_tp,$itype,$iscore,$idnm) = $self->col_names($infile,qw(chr beg end smpl tp/fp type RandomForestScore DNM));
+
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $out '#'.join("\t",qw(chr beg end smpl type score length cbrowse))."\n";
+    close($out);
+
+    my $cmd = "| sort -k6,6gr -k7,7gr | gzip -c >> $outfile.part";
+    print STDERR "$cmd\n";
+
+    open(my $in,"gunzip -c $infile |") or $self->throw("gunzip -c $infile: $!");
+    open($out,$cmd) or $self->throw("$cmd: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        chomp($line);
+        my @vals = split(/\t/,$line);
+        if ( $vals[$is_tp] ne '.' ) { next; }
+        if ( $vals[$idnm] ne '1' ) { next; }
+        my $len = $vals[$iend] - $vals[$ibeg] + 1;
+        my $cbrowse = qq[=HYPERLINK("http://ddd-view.dev.sanger.ac.uk/index.html?$vals[$ismpl];$vals[$ichr];$vals[$ibeg];$vals[$iend]","cbrowse")];
+        print $out join("\t",$vals[$ichr],$vals[$ibeg],$vals[$iend],$vals[$ismpl],$vals[$itype],$vals[$iscore],$len,$cbrowse)."\n";
+    }
+    close($out) or $self->throw("close failed: $cmd");
+    close($in) or $self->throw("close failed: gunzip -c $infile");
+    $self->cmd("gunzip -c $outfile.part | gzip -c > $outfile.part2 && mv $outfile.part2 $outfile.part");    # the 0-block makes ooffice stop
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub random_forest
+{
+    my ($self,$outfile,$infile) = @_;
+    my @callers = ();
+    for my $caller (@{$$self{callers}}) { push @callers, $$caller{name}; }
+    my $callers = join(',',@callers);
+    my $cmd = qq[zcat $infile | $$self{random_forest} -o $outfile.part -f tp/fp,concordance,$callers,read-depth-fraction,number-of-probes,l2r-pval,length,GC,mappable,nflank,l2r_mean,l2r_dev,l2r_flank_diff];
+    $self->cmd($cmd);
+    rename("$outfile.part.log","$outfile.log") or $self->throw("rename $outfile.part.log $outfile.log: $!");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub merge_batches
+{
+    my ($self,$outfile,$batches,$key) = @_;
+    my $first = 1;
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    for my $batch (@$batches)
+    {
+        open(my $in,"gunzip -c $$batch{$key} |") or $self->throw("gunzip -c $$batch{$key}: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ )
+            {
+                if ( !$first ) { next; }
+                $first = 0;
+            }
+            print $fh $line;
+        }
+        close($in) or $self->throw("close failed: gunzip -c $$batch{$key}");
+    }
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+
+sub read_batches
+{
+    my ($self,$dir) = @_;
+    if ( !$self->is_finished("$dir/batch.txt") )
+    {
+        my $ibatch = 0;
+        open(my $fh,'>',"$dir/batch.txt.part") or $self->throw("$dir/batch.txt.part: $!");
+        $self->cmd("mkdir -p $dir/batch");
+        my $n = 0;
+        my $out = undef;
+        my $cmd = undef;
+        my $smpl_prev = undef;
+        open(my $in,"gunzip -c $dir/candidates.txt.gz |") or $self->throw("gunzip -c $dir/candidates.txt.gz: $!");
+        while (my $line=<$in>)
+        {
+            my ($smpl,undef) = split(/\t/,$line);
+            if ( !defined $out or ($n>$$self{nbatch} && $smpl ne $smpl_prev) )
+            {
+                if ( defined $out ) { close($out) or $self->throw("close failed: $cmd"); }
+                $cmd = "gzip -c > $dir/batch/$ibatch.txt.gz";
+                open($out,"| $cmd") or $self->throw("close failed: $cmd");
+                print $fh "$dir/batch/$ibatch.txt.gz\n";
+                $ibatch++;
+                $n = 0;
+            }
+            $smpl_prev = $smpl;
+            print $out $line;
+            $n++;
+        }
+        if ( defined $out ) { close($out) or $self->throw("close failed: $cmd"); }
+        close($in) or $self->throw("close failed: gunzip -c $dir/candidates.txt.gz ");
+        close($fh) or $self->throw("close failed: $dir/batch.txt.part");
+        rename("$dir/batch.txt.part","$dir/batch.txt") or $self->throw("rename $dir/batch.txt.part $dir/batch.txt: $!");
+    }
+    my @batch = ();
+    my @files = grep { chomp } $self->cmd("cat $dir/batch.txt");
+    for my $file (@files)
+    {
+        if ( !($file=~m{([^\.]+)/(\d+)\.txt\.gz$}) ) { $self->throw("Could not parse: $file"); }
+        push @batch, { file=>$file, type=>$1, num=>$2 };
+    }
+
+    # Uncomment to include only the first and last batch for testing:
+    #   splice(@batch,1,scalar @batch - 2);
+
+    return \@batch;
+}
+
+sub create_candidates
+{
+    my ($self,$outdir) = @_;
+
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my $debug_region  = undef;
+    my $debug_samples = undef;
+    if ( exists($$self{debug_region}) )
+    {
+        $debug_samples = { map { $_ => 1 } split(/,/,$$self{debug_samples}) };
+        if ( !($$self{debug_region}=~/^(.+):(\d+)-(\d+)/) ) { $self->throw("Cannot parse: $$self{debug_region}"); }
+        $$debug_region{chr} = $1;
+        $$debug_region{beg} = $2;
+        $$debug_region{end} = $3;
+    }
+
+    # Put calls from all callers together: sample, chr, beg, end, type, qual, caller
+    open(my $fh,"| sort -k1,1d -k2,2d -k3,3n -k4,4n | gzip -c > $dir/candidates.txt.gz") or $self->throw("sort -k1,1d -k2,2d -k3,3n -k4,4n | gzip -c > $dir/candidates.txt.gz: $!");
+
+    for my $caller (@{$$self{callers}})
+    {
+        my ($cols,$itype,$ichr,$ibeg,$iend,$ismpl,$iqual) = $self->col_names($$caller{calls},@{$$caller{keys}});
+
+        open(my $in,"gunzip -c $$caller{calls} |") or $self->throw("gunzip -c $$caller{calls}: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            if ( defined $debug_samples )
+            {
+                if ( !exists($$debug_samples{$col[$ismpl]}) ) { next; }
+                if ( $$debug_region{chr} ne $col[$ichr] ) { next; }
+                if ( $$debug_region{beg} > $col[$iend] ) { next; }
+                if ( $$debug_region{end} < $col[$ibeg] ) { next; }
+            }
+            my $type;
+            if ( $col[$itype] eq 'DUP' ) { $type = 'DUP'; }
+            elsif ( $col[$itype] eq 'DEL' ) { $type = 'DEL'; }
+            else { $self->throw("Unknown type <$col[$itype]>  in $$caller{calls}"); }
+            print $fh join("\t", $col[$ismpl],$col[$ichr],$col[$ibeg],$col[$iend],$type,$col[$iqual],$$caller{name})."\n";
+        }
+        close($in) or $self->throw("close failed: gunzip -c $$caller{calls}");
+    }
+    close($fh) or $self->throw("close failed: sort -k1,1d -k2,2d -k3,3n -k4,4n | gzip -c > $dir/candidates.txt.gz");
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub init_tables
+{
+    my ($self) = @_;
+    if ( !$self->is_finished("$$self{outdir}/baits") )
+    {
+        $self->cmd("mkdir -p $$self{outdir}/baits.part");
+        open(my $fh,'>',"$$self{outdir}/baits.part/bait2bait.txt") or $self->throw("$$self{outdir}/baits.part/bait2bait.txt: $!");
+        my @baits = grep { chomp } $self->cmd("cat $$self{samples} | cut -f2 | sort | uniq");
+        my $ifile = 0;
+        for my $bait (@baits)
+        {
+            $ifile++;
+            open(my $in,'<',$bait) or $self->throw("$bait: $!");
+            open(my $out,"| bgzip -c > $$self{outdir}/baits.part/baits.$ifile.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/baits.part/baits.$ifile.txt.gz: $!");
+            my $prev_chr;
+            my $idx = 0;
+            while (my $line=<$in>)
+            {
+                my ($chr,$beg,$end) = split(/\t/,$line);
+                chomp($end);
+                if ( !defined $prev_chr or $chr ne $prev_chr ) { $prev_chr = $chr; $idx = 0; }
+                print $out "$chr\t$beg\t$end\t$idx\n";
+                $idx++;
+            }
+            close($out) or $self->throw("close failed: bgzip -c > $$self{outdir}/baits.part/baits.$ifile.txt.gz");
+            close($in) or $self->throw("close failed: $bait");
+            $self->cmd(qq[tabix -s1 -b2 -e3 $$self{outdir}/baits.part/baits.$ifile.txt.gz]);
+            print $fh "$bait\t$$self{outdir}/baits/baits.$ifile.txt.gz\n";
+        }
+        close($fh) or $self->throw("close failed: $$self{outdir}/baits.part/bait2bait.txt");
+        rename("$$self{outdir}/baits.part","$$self{outdir}/baits") or $self->throw("rename $$self{outdir}/baits.part $$self{outdir}/baits: $!");
+    }
+    for my $line (grep {chomp} $self->cmd("cat $$self{outdir}/baits/bait2bait.txt"))
+    {
+        my ($ori,$new) = split(/\t/,$line);
+        $$self{bait2bait}{$ori} = $new;
+    }
+
+
+    # Create bait2gc mapping
+    if ( !$self->is_finished("$$self{outdir}/gc") )
+    {
+        $self->cmd("mkdir -p $$self{outdir}/gc.part");
+        my @bait = grep {chomp} $self->cmd("cat $$self{outdir}/baits/bait2bait.txt");
+        for (my $i=0; $i<@bait; $i++)
+        {
+            $bait[$i] =~ s/\t.*$//;
+            my $ifile = $i + 1;
+            $self->spawn('bait2gc',"$$self{outdir}/gc.part/gc.$ifile.txt.gz", $bait[$i]);
+        }
+        $self->wait;
+
+        open(my $fh,'>',"$$self{outdir}/gc.part/bait2gc.txt") or $self->throw("$$self{outdir}/gc.part/bait2gc.txt: $!");
+        for (my $i=0; $i<@bait; $i++)
+        {
+            my $ifile = $i + 1;
+            print $fh "$bait[$i]\t$$self{outdir}/gc/gc.$ifile.txt.gz\n";
+        }
+        close($fh) or $self->throw("close failed: $$self{outdir}/gc.part/bait2gc.txt");
+        rename("$$self{outdir}/gc.part","$$self{outdir}/gc") or $self->throw("rename $$self{outdir}/gc.part $$self{outdir}/gc: $!");
+    }
+    for my $line (grep {chomp} $self->cmd("cat $$self{outdir}/gc/bait2gc.txt"))
+    {
+        my ($bait,$gc) = split(/\t/,$line);
+        $$self{bait2gc}{$bait} = $gc;
+    }
+
+
+    # Create a mapping from samples to bams, baits, gc
+    open(my $fh,'<',$$self{samples}) or $self->throw("$$self{samples}: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my %rec;
+        @rec{qw(bam baits smpl sex)} = split(/\t/,$line);
+        if ( !exists($$self{bait2bait}{$rec{baits}}) ) { $self->throw("Failed to init the baits: $rec{baits}"); }
+        if ( !exists($$self{bait2gc}{$rec{baits}}) ) { $self->throw("Failed to init the gc: $rec{baits}"); }
+        $rec{gc}    = $$self{bait2gc}{$rec{baits}};
+        $rec{baits} = $$self{bait2bait}{$rec{baits}};
+        if ( exists($$self{smpl2info}{$rec{smpl}}) ) { $self->warn("The sample \"$rec{smpl}\" is present twice in $$self{samples}\n"); next; }
+        $$self{smpl2info}{$rec{smpl}} = \%rec;
+    }
+    close($fh) or $self->throw("close failed: $$self{samples}");
+}
+sub bait2gc
+{
+    my ($self,$outfile,$baits) = @_;
+    open(my $out,"| bgzip -c > $outfile.part") or $self->throw("bgzip -c > $outfile.part: $!");
+    open(my $in,'<',$baits) or $self->throw("$baits: $!");
+    while (my $line=<$in>)
+    {
+        # A very slow way to do it, but done only once
+        chomp($line);
+        my ($chr,$beg,$end,undef) = split(/\t/,$line);
+        my @fa_lines = $self->cmd("samtools faidx $$self{fa_ref} $chr:$beg-$end",verbose=>0);
+        my $nbp = 0;
+        my $ngc = 0;
+        for my $fa_line (@fa_lines)
+        {
+            if ( $fa_line=~/^>/ ) { next; }
+            my $len = length($fa_line);
+            for (my $i=0; $i<$len; $i++)
+            {
+                my $base = lc(substr($fa_line,$i,1));
+                if ( $base eq 'g' or $base eq 'c' ) { $ngc++; $nbp++; }
+                elsif ( $base eq 't' or $base eq 'a' ) { $nbp++; }
+            }
+        }
+        printf $out "$chr\t$beg\t$end\t%f\n", $nbp ? $ngc/$nbp : 0;
+    }
+    close($in) or $self->throw("close failed: $baits");
+    close($out) or $self->throw("close failed: bgzip -c > $outfile.part");
+    $self->cmd("tabix -s1 -b2 -e2 $outfile.part");
+    rename("$outfile.part.tbi","$outfile.tbi") or $self->throw("rename $outfile.part.tbi $outfile.tbi: $!");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub resolve_breakpoints
+{
+    my ($self,$outfile,$batch) = @_;
+    my @callers = ();
+    for my $caller (@{$$self{callers}}) { push @callers,$$caller{name}; }
+
+    open(my $out,"| gzip -c > $outfile.part")  or $self->throw("gzip -c $outfile.part: $!");
+    open(my $in,"gunzip -c $$batch{file} |") or $self->throw("gunzip -c $$batch{file}: $!");
+
+    # Print header
+    my $i = 1;
+    printf $out "# [%d]smpl",$i++;
+    printf $out "\t[%d]chr",$i++;
+    printf $out "\t[%d]beg",$i++;
+    printf $out "\t[%d]end",$i++;
+    printf $out "\t[%d]type",$i++;
+    printf $out "\t[%d]concordance",$i++;
+    for my $name (@callers) { printf $out "\t[%d]$name", $i++; }
+    printf $out "\t[%d]l2r-pval",$i++;
+    printf $out "\t[%d]read-depth-fraction",$i++;
+    printf $out "\t[%d]number-of-probes",$i++;
+    print $out "\n";
+
+    my @buf = ();
+    while (my $line=<$in>)
+    {
+        if ( $$self{debug_region} ) { print STDERR "dbg_in: $line"; }
+
+        chomp($line);
+        my %rec;
+        @rec{qw(smpl chr beg end type qual caller)} = split(/\t/,$line);
+        if ( $rec{chr} eq 'Y' ) { next; }
+        $rec{end_max} = $rec{end};
+        push @buf, \%rec;
+
+        if ( scalar @buf == 1 ) { next; }
+        if ( $buf[-2]{smpl} eq $buf[-1]{smpl} && $buf[-2]{chr} eq $buf[-1]{chr} )
+        {
+            if ( $buf[-2]{beg} > $buf[-1]{beg} ) { $self->throw("Unsorted: $batch .. $line\n"); }
+            elsif ( $buf[-2]{beg} == $buf[-1]{beg} && $buf[-2]{end} > $buf[-1]{end} ) { $self->throw("Unsorted: $batch .. $line\n"); }
+
+            if ( $buf[-2]{end_max} >= $buf[-1]{beg} )
+            {
+                if ( $buf[-2]{end_max} > $buf[-1]{end_max} ) { $buf[-1]{end_max} = $buf[-2]{end_max} }
+                next;
+            }
+        }
+        $self->resolve_breakpoints_flush($out,\@callers,\@buf,scalar @buf-1);
+    }
+    $self->resolve_breakpoints_flush($out,\@callers,\@buf,scalar @buf);
+    close($in) or $self->throw("close failed: gunzip -c $$batch{file}");
+    close($out) or $self->throw("close failed: gzip -c $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub calc_pval_noise
+{
+    my ($val) = @_;
+    return (1 - 1/(1 + exp(-($val-0.3)*20)))* 1/(1+exp(-($val+0.3)*20));
+}
+sub calc_pval_del
+{
+    my ($val) = @_;
+    return (1 - 1/(1 + exp(-($val+0.7)*20)))* 1/(1+exp(-($val+1.3)*20));
+}
+sub calc_pval_dup
+{
+    my ($val) = @_;
+    return (1 - 1/(1 + exp(-($val-0.9)*20)))* 1/(1+exp(-($val-0.3)*20));
+}
+
+# Create a list of breakpoints; for each interval get its L2R mean;
+# calculate the probability of DEL, DUP, NOISE assuming a wide bell-shaped density
+# functions centered at -1, 0.5 and 0. See the top of the script for more.
+#
+sub resolve_breakpoints_flush
+{
+    my ($self,$out,$callers,$buf,$nflush) = @_;
+
+    my $smpl = $$buf[0]{smpl};
+    my $chr  = $$buf[0]{chr};
+    my $type = $$buf[0]{type};
+    my %callers = ();
+    my %bpoints = ();
+    for (my $i=0; $i<$nflush; $i++)
+    {
+        if ( $$buf[$i]{smpl} ne $$buf[0]{smpl} ) { $self->throw("This is a bug: $$buf[$i]{smpl} ne $$buf[0]{smpl}\n"); }
+        if ( !exists($callers{$$buf[$i]{caller}}) or $callers{$$buf[$i]{caller}} < $$buf[$i]{qual} )
+        {
+            $callers{$$buf[$i]{caller}} = $$buf[$i]{qual};
+        }
+        $bpoints{$$buf[$i]{beg}} = 1;
+        $bpoints{$$buf[$i]{end}} = 1;
+    }
+    my @callers = ();
+    for my $caller (@$callers) { push @callers, exists($callers{$caller}) ? $callers{$caller} : 0; }
+    my $ncallers = scalar keys %callers;
+
+    my $l2r_file = $$self{smpl2info}{$smpl}{bam}.'.l2r.txt.gz';
+    if ( !exists($$self{tabix_l2r}) ) { $$self{tabix_l2r} = TabixCache->new(norm=>1,col=>3); }
+
+    # If one caller overcalls and merges two small CNVs into one, the RD ratio sometimes incorrectly
+    # trims the big call instead of making two smaller ones. Here we create a list of intervals, determine 
+    # which ones to keep and which ones to throw away.
+    my @bpoints = sort { $a<=>$b } keys %bpoints;
+    my @types   = ();
+    for (my $i=0; $i+1<@bpoints; $i++)
+    {
+        my $dp = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$bpoints[$i],end=>$bpoints[$i+1]);
+        if ( !@$dp ) { push @types,0; next; }
+        my $mean = calc_mean($dp);
+        my $dup   = calc_pval_dup($mean);
+        my $del   = calc_pval_del($mean);
+        my $noise = calc_pval_noise($mean);
+        my $type = $dup > $del ? ($dup >= $noise ? 1 : 0) : ($del >= $noise ? -1 : 0);
+        push @types, $type;
+        if ( $$self{debug_region} )
+        {
+            print STDERR "\tdbg_brk: $smpl $chr:$bpoints[$i]-$bpoints[$i+1] \t type=$type mean=$mean\t$dup,$noise,$del\n";
+        }
+    }
+    if ( $$self{debug_region} )
+    { 
+        print STDERR "dbg_brk: $smpl\t$chr .. ".join(',',@bpoints)."\t".join(',',@types)."\n";
+    }
+
+    my $nprn = 0;
+    my ($ibeg,$i);
+    for ($i=0; $i<@types; $i++)
+    {
+        if ( !defined $ibeg )
+        {
+            if ( $types[$i]==0 ) { next; }
+            $ibeg = $i;
+        }
+        if ( $types[$i]!=$types[$ibeg] )
+        {
+            my $beg = $bpoints[$ibeg];
+            my $end = $bpoints[$i];
+            if ( $beg ne $end )
+            {
+                my ($rdf,$nprobes) = $self->read_depth_fraction($smpl,$chr,$beg,$end);
+                my $dp   = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$end);
+                my $mean = calc_mean($dp);
+                my $pval = $types[$ibeg]==-1 ? calc_pval_del($mean) : calc_pval_dup($mean);
+                $rdf  = sprintf("%.2f",$rdf);
+                $pval = sprintf("%.2f",$pval);
+                print $out "$smpl\t$chr\t$beg\t$end\t$type\t$ncallers\t".join("\t",@callers)."\t$pval\t$rdf\t$nprobes\n";
+                $nprn++;
+                if ( $$self{debug_region} ) { print STDERR "dbg_out: $smpl\t$chr\t$beg\t$end\t$type\t$ncallers\t".join("\t",@callers)."\t$pval\t$rdf\t$nprobes\n"; }
+            }
+            $ibeg = $types[$i]==0 ? undef : $i;
+        }
+    }
+    if ( !$nprn && !defined $ibeg ) { $ibeg = 0; $i = @types - 1; }
+    if ( defined $ibeg )
+    {
+        my $beg = $bpoints[$ibeg];
+        my $end = $bpoints[$i];
+        if ( $beg ne $end )
+        {
+            my ($rdf,$nprobes) = $self->read_depth_fraction($smpl,$chr,$beg,$end);
+            my $dp   = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$end);
+            my $mean = calc_mean($dp);
+            my $pval = $types[$ibeg]==-1 ? calc_pval_del($mean) : calc_pval_dup($mean);
+            $rdf  = sprintf("%.2f",$rdf);
+            $pval = sprintf("%.2f",$pval);
+            print $out "$smpl\t$chr\t$beg\t$end\t$type\t$ncallers\t".join("\t",@callers)."\t$pval\t$rdf\t$nprobes\n";
+            if ( $$self{debug_region} ) { print STDERR "dbg_out: $smpl\t$chr\t$beg\t$end\t$type\t$ncallers\t".join("\t",@callers)."\t$pval\t$rdf\t$nprobes\n"; }
+        }
+    }
+    splice(@$buf,0,$nflush);
+}
+
+#   sub resolve_breakpoints_flush_ori
+#   {
+#       my ($self,$out,$callers,$buf,$nflush) = @_;
+#   
+#       my $smpl = $$buf[0]{smpl};
+#       my $chr  = $$buf[0]{chr};
+#       my $type = $$buf[0]{type};
+#       my %callers = ();
+#       for (my $i=0; $i<$nflush; $i++)
+#       {
+#           if ( $$buf[$i]{smpl} ne $$buf[0]{smpl} ) { $self->throw("This is a bug: $$buf[$i]{smpl} ne $$buf[0]{smpl}\n"); }
+#           if ( !exists($callers{$$buf[$i]{caller}}) or $callers{$$buf[$i]{caller}} < $$buf[$i]{qual} )
+#           {
+#               $callers{$$buf[$i]{caller}} = $$buf[$i]{qual};
+#           }
+#       }
+#       my @callers = ();
+#       for my $caller (@$callers) { push @callers, exists($callers{$caller}) ? $callers{$caller} : 0; }
+#       my $ncallers = scalar keys %callers;
+#   
+#       # Simple approach: extend the overlaping calls to include the maximum
+#       my $beg  = $$buf[0]{beg};
+#       my $end  = $$buf[$nflush-1]{end_max};
+#       my ($rdr,$nprobes) = $self->feature_read_depth_ratio($smpl,$chr,$beg,$end);
+#   
+#       if ( $$self{debug_region} ) { print STDERR "dbg_tmp: $smpl\t$chr\t$beg\t$end\t$rdr\t$nprobes\n"; }
+#   
+#       # More advanced approach: investigate the read depth ratio for each possible breakpoint pair
+#       if ( $nflush > 1 )
+#       {
+#           for (my $i=0; $i<$nflush; $i++)
+#           {
+#               for (my $j=0; $j<$nflush; $j++)
+#               {
+#                   my $beg0 = $$buf[$i]{beg};
+#                   my $end0 = $$buf[$j]{end};
+#                   if ( $beg0 >= $end0 ) { next; }
+#   
+#                   my ($ij_rdr,$ij_nprobes) = $self->feature_read_depth_ratio($smpl,$chr,$beg0,$end0);
+#                   if ( !defined $ij_rdr ) { next; }
+#                   if ( $$self{debug_region} ) { print STDERR "dbg_tmp: $smpl\t$chr\t$beg\t$end\t$ij_rdr\t$ij_nprobes\n"; }
+#   
+#                   if ( !defined $rdr or ($type eq 'DEL' && $ij_rdr < $rdr) or ($type eq 'DUP' && $ij_rdr > $rdr) )
+#                   {
+#                       $beg = $beg0;
+#                       $end = $end0;
+#                       $rdr = $ij_rdr;
+#                       $nprobes = $ij_nprobes;
+#                   }
+#               }
+#           }
+#       }
+#   
+#       if ( defined $rdr )
+#       {
+#           $rdr = sprintf("%.3f",$rdr);
+#           print $out "$smpl\t$chr\t$beg\t$end\t$type\t$ncallers\t".join("\t",@callers)."\t$rdr\t$nprobes\n";
+#           if ( $$self{debug_region} ) { print STDERR "dbg_out: $smpl\t$chr\t$beg\t$end\t$rdr\t$nprobes\n"; }
+#       }
+#   
+#       splice(@$buf,0,$nflush);
+#   }
+
+#   sub feature_read_depth_ratio_ori
+#   {
+#       my ($self,$smpl,$chr,$beg,$end) = @_;
+#       if ( !exists($$self{smpl2info}{$smpl}) ) { $self->throw("No such sample in $$self{samples}: $smpl\n"); }
+#       my $baits = $$self{smpl2info}{$smpl}{baits};
+#   
+#       # Find out the index of the first and last probe
+#       my @lines = $self->cmd("tabix $baits $chr:$beg-$end",verbose=>0);
+#       if ( !scalar @lines )
+#       {
+#           # This happens when a sample was sequenced twice with different baits and we are
+#           # attempting to use the other one.
+#           for my $other (values %{$$self{bait2bait}})
+#           {
+#               @lines = $self->cmd("tabix $other $chr:$beg-$end",verbose=>0);
+#               if ( @lines )
+#               {
+#                   $baits = $other;
+#                   last;
+#               }
+#           }
+#           if ( !@lines )
+#           {
+#               # In such case just skip the call.
+#               return (undef,undef);
+#           }
+#       }
+#       chomp($lines[0]);
+#       chomp($lines[-1]);
+#       if ( !($lines[0]=~/(\d+)$/) ) { $self->throw("No result: tabix $baits $chr:$beg-$end"); }
+#       my $ibeg = $1;
+#       if ( !($lines[-1]=~/(\d+)$/) ) { $self->throw("No result: tabix $baits $chr:$beg-$end"); }
+#       my $iend = $1;
+#       my $nprobes = $iend - $ibeg + 1;
+#   
+#       # Get the coverage: region, left and right
+#       my $ibeg0 = $ibeg-1-int($nprobes/2);
+#       my $iend0 = $iend+1+int($nprobes/2);
+#       my $cov_mid   = $self->feature_coverage($baits,$smpl,$chr,$ibeg,$iend);
+#       my $cov_left  = $self->feature_coverage($baits,$smpl,$chr,$ibeg0,$ibeg-1);
+#       my $cov_right = $self->feature_coverage($baits,$smpl,$chr,$iend+1,$iend0);
+#   
+#       # print "XX: $smpl .. $baits $$self{smpl2info}{$smpl}{bam}.multicov.gz .. $chr:$beg-$end .. cov_mid=$cov_mid / ".($cov_left+$cov_right)."  nprobes=$nprobes  i=$ibeg,$iend\n";
+#       my $rdr = ($cov_left + $cov_right > 0) ? $cov_mid / ($cov_left + $cov_right) : undef;
+#   
+#       return ($rdr,$nprobes);
+#   }
+sub read_depth_fraction
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+
+    my $dp_file = $$self{smpl2info}{$smpl}{bam}.'.multicov.gz';
+    if ( !exists($$self{tabix_dp}) ) { $$self{tabix_dp} = TabixCache->new(norm=>1,col=>3); }
+
+    my $dp = $$self{tabix_dp}->get_entries(file=>$dp_file,chr=>$chr,beg=>$beg,end=>$end);
+    my $dp_left  = $$self{tabix_dp}->get_entries(file=>$dp_file,chr=>$chr,beg=>$beg,end=>$beg,extend=>-$$self{nprobes_extend});
+    my $dp_right = $$self{tabix_dp}->get_entries(file=>$dp_file,chr=>$chr,beg=>$end,end=>$end,extend=>$$self{nprobes_extend});
+    my $nprobes  = scalar @$dp;
+    my $mean_mid   = calc_mean($dp);
+    my $mean_flank = calc_mean([@$dp_left,@$dp_right]);
+    my $rdf = $mean_mid / ($mean_mid + $mean_flank);
+
+    return ($rdf,$nprobes);
+}
+sub feature_coverage
+{
+    my ($self,$baits,$smpl,$chr,$ibeg,$iend) = @_;
+
+    # Create a lookup table from bait number to a region
+    if ( !exists($$self{ibait2reg}{$baits}) )
+    {
+        open(my $fh,"gunzip -c $baits |") or $self->throw("gunzip -c $baits: $!");
+        while (my $line=<$fh>)
+        {
+            my ($chr,$beg,$end,$idx) = split(/\t/,$line);
+            $$self{ibait2reg}{$baits}{$chr}[$idx] = [$beg,$end];
+        }
+        close($fh) or $self->throw("close failed: gunzip -c $baits");
+    }
+
+    if ( $ibeg < 0 ) { $ibeg = 0; }
+    if ( $iend < 0 ) { $iend = 0; }
+    if ( $ibeg >= scalar @{$$self{ibait2reg}{$baits}{$chr}} ) { $ibeg = scalar @{$$self{ibait2reg}{$baits}{$chr}} - 1; }
+    if ( $iend >= scalar @{$$self{ibait2reg}{$baits}{$chr}} ) { $iend = scalar @{$$self{ibait2reg}{$baits}{$chr}} - 1; }
+    my $beg = $$self{ibait2reg}{$baits}{$chr}[$ibeg][0];
+    my $end = $$self{ibait2reg}{$baits}{$chr}[$iend][1];
+    if ( !defined $beg or !defined $end ) { $self->throw("Out of bounds: $smpl $chr $ibeg,$iend .. $baits\n"); }
+
+    my $multicov = $$self{smpl2info}{$smpl}{bam}.'.multicov.gz';
+
+    #   if ( !$self->is_finished("$multicov.tbi") )     # make sure it's bgzipped and tabix indexed
+    #   {
+    #       $self->cmd("gunzip -c $multicov | bgzip -c > $multicov.part && tabix -s1 -b2 -e2 $multicov.part");
+    #       rename("$multicov.part",$multicov) or $self->throw("rename $multicov.part $multicov: $!");
+    #       rename("$multicov.part.tbi","$multicov.tbi") or $self->throw("rename $multicov.part.tbi $multicov.tbi: $!");
+    #   }
+
+    chomp(my $cov = ($self->cmd(qq[tabix $multicov $chr:$beg-$end | awk '{cov+=\$4;len+=\$3-\$2+1;}END{print cov/len}'],verbose=>0,exit_on_error=>0))[0]);
+    if ( !defined $cov ) { $cov = 0; }
+    return $cov;
+}
+sub add_features
+{
+    my ($self,$outfile,$batch) = @_;
+    open(my $out,"| gzip -c > $outfile.part")  or $self->throw("gzip -c $outfile.part: $!");
+    open(my $in,"gunzip -c $$batch{breakpoints} |") or $self->throw("gunzip -c $$batch{breakpoints}: $!");
+    while (my $line=<$in>)
+    {
+        chomp($line);
+        if ( $line=~/^#/ )
+        {
+            print $out join("\t",$line,qw(length GC mappable nflank l2r_mean l2r_dev l2r_flank_diff tp/fp))."\n";
+            next;
+        }
+        my @rec = split(/\t/,$line);
+        my $smpl = $rec[0];
+        my $chr  = $rec[1];
+        my $beg  = $rec[2];
+        my $end  = $rec[3];
+        my $nflank   = $self->feature_nflank($smpl,$chr,$beg,$end);
+        my $mappable = $self->feature_mappable($smpl,$chr,$beg,$end);
+        my $gc       = $self->feature_gc($smpl,$chr,$beg,$end);
+        my $length   = $end - $beg + 1;
+        my $tp_fp    = $self->feature_curated($smpl,$chr,$beg,$end);
+        my ($l2r_mean,$l2r_dev,$l2r_flank) = $self->feature_l2r_stats($smpl,$chr,$beg,$end);
+        print $out join("\t",@rec,$length,$gc,$mappable,$nflank,$l2r_mean,$l2r_dev,$l2r_flank,$tp_fp)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$batch{breakpoints}");
+    close($out) or $self->throw("close failed: gzip -c $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+# Extend the region by a fixed number of probes on both sides - $$self{nprobes_extend}
+sub extend_bait_region
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+
+    if ( !exists($$self{smpl2info}{$smpl}) ) { $self->throw("No such sample in $$self{samples}: $smpl\n"); }
+    my $baits = $$self{smpl2info}{$smpl}{baits};
+
+    # Find out the index of the first and last probe
+    my @lines = $self->cmd("tabix $baits $chr:$beg-$end",verbose=>0);
+    if ( !scalar @lines )
+    {
+        # This happens when a sample was sequenced twice with different baits and we are
+        # attempting to use the other one.
+        for my $other (values %{$$self{bait2bait}})
+        {
+            @lines = $self->cmd("tabix $other $chr:$beg-$end",verbose=>0);
+            if ( @lines )
+            {
+                $baits = $other;
+                last;
+            }
+        }
+        if ( !@lines ) { return ($beg,$end); }  # could not extend
+    }
+    chomp($lines[0]);
+    chomp($lines[-1]);
+    if ( !($lines[0]=~/(\d+)$/) ) { $self->throw("No result: tabix $baits $chr:$beg-$end"); }
+    my $ibeg = $1;
+    if ( !($lines[-1]=~/(\d+)$/) ) { $self->throw("No result: tabix $baits $chr:$beg-$end"); }
+    my $iend = $1;
+
+    # Create a lookup table from bait number to a region
+    if ( !exists($$self{ibait2reg}{$baits}) )
+    {
+        open(my $fh,"gunzip -c $baits |") or $self->throw("gunzip -c $baits: $!");
+        while (my $line=<$fh>)
+        {
+            my ($chr,$beg,$end,$idx) = split(/\t/,$line);
+            $$self{ibait2reg}{$baits}{$chr}[$idx] = [$beg,$end];
+        }
+        close($fh) or $self->throw("close failed: gunzip -c $baits");
+    }
+
+    $ibeg -= $$self{nprobes_extend};
+    $iend += $$self{nprobes_extend};
+
+    if ( $ibeg < 0 ) { $ibeg = 0; }
+    if ( $iend < 0 ) { $iend = 0; }
+    if ( $ibeg >= scalar @{$$self{ibait2reg}{$baits}{$chr}} ) { $ibeg = scalar @{$$self{ibait2reg}{$baits}{$chr}} - 1; }
+    if ( $iend >= scalar @{$$self{ibait2reg}{$baits}{$chr}} ) { $iend = scalar @{$$self{ibait2reg}{$baits}{$chr}} - 1; }
+    my $beg0 = $$self{ibait2reg}{$baits}{$chr}[$ibeg][0];
+    my $end0 = $$self{ibait2reg}{$baits}{$chr}[$iend][1];
+    if ( !defined $beg0 or !defined $end0 ) { $self->throw("Out of bounds: $smpl $chr $ibeg,$iend .. $baits\n"); }
+
+    return ($beg0,$end0);
+}
+sub calc_mean
+{
+    my ($vals) = @_;
+    if ( !@$vals ) { return 0; }
+    my $mean = 0;
+    for my $val (@$vals) { $mean += $val; }
+    $mean /= @$vals;
+    return $mean;
+}
+sub calc_dev2
+{
+    my ($vals,$mean) = @_;
+    if ( !@$vals ) { return 0; }
+    my $dev2 = 0;
+    for my $val (@$vals) { $dev2 += ($val-$mean)**2; }
+    $dev2 /= @$vals;
+    return $dev2;
+}
+sub normalize_l2r   # some samples have significant deviation
+{
+    my ($self,$bam,$vals) = @_;
+    my $mean;
+    if ( !exists($$self{l2r_norm}{$bam}) ) 
+    {
+        chomp($mean = ($self->cmd(qq[tabix $bam.l2r.txt.gz 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 | awk '{s+=\$4;n++}END{print s/n}'],verbose=>0))[0]);
+        $$self{l2r_norm}{$bam} = $mean;
+    }
+    $mean = $$self{l2r_norm}{$bam};
+    for my $val (@$vals) { $val -= $mean; }
+}
+sub feature_l2r_stats
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+
+    if ( !exists($$self{tabix_l2r}) ) { $$self{tabix_l2r} = TabixCache->new(norm=>1,col=>3); }
+    my $l2r_file = $$self{smpl2info}{$smpl}{bam}.'.l2r.txt.gz';
+    my $l2r  = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$end);
+    my $l2r0 = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$beg,extend=>-$$self{nprobes_extend});
+    my $l2r1 = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$end,end=>$end,extend=>$$self{nprobes_extend});
+
+    my $mean_l2r0 = calc_mean($l2r0);
+    my $mean_l2r  = calc_mean($l2r);
+    my $mean_l2r1 = calc_mean($l2r1);
+    my $dev2_l2r  = calc_dev2($l2r,$mean_l2r);
+    my $flank_l2r = $mean_l2r - 0.5*($mean_l2r0 + $mean_l2r1);
+    return (sprintf("%.2f",$mean_l2r),sprintf("%.2f",$dev2_l2r),sprintf("%.2f",$flank_l2r));
+}
+sub feature_curated
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+    my @lines = $self->cmd("tabix $$self{training} $chr:$beg-$end",verbose=>0);
+    for my $line (@lines)
+    {
+        chomp($line);
+        my %row;
+        @row{qw(chr beg end tp_fp type sample)} = split(/\t/,$line);
+        if ( $row{sample} eq $smpl ) { return $row{tp_fp}; }
+    }
+    return '.';
+}
+sub feature_nflank
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+    if ( !exists($$self{smpl2info}{$smpl}) ) { $self->throw("No such sample in $$self{samples}: $smpl\n"); }
+    my $baits = $$self{smpl2info}{$smpl}{baits};
+    my $delta = int(($end - $beg + 1)/2);
+    my $beg0 = $beg - $delta;
+    my $end0 = $end + $delta;
+    if ( $beg0 <= 0 ) { $beg0 = 1; }
+    chomp(my $nflank = ($self->cmd(qq[tabix $baits $chr:$beg0-$end0 | awk '\$3<$beg || \$2>$end' | wc -l],verbose=>0))[0]);
+    return $nflank;
+}
+sub feature_mappable
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+    if ( !exists($$self{smpl2info}{$smpl}) ) { $self->throw("No such sample in $$self{samples}: $smpl\n"); }
+    my $baits = $$self{smpl2info}{$smpl}{baits};
+    my @baits = $self->cmd("tabix $baits $chr:$beg-$end",verbose=>0);
+    for my $bait (@baits)
+    {
+        chomp($bait);
+        my ($bait_chr,$bait_beg,$bait_end,undef) = split(/\t/,$bait);
+        if ( $bait_beg < $beg ) { $beg = $bait_beg; }
+        if ( $bait_end > $end ) { $end = $bait_end; }
+    }
+
+    my $sum = 0;
+    my $len = 0;
+    my @map_lines = $self->cmd("tabix $$self{mappable} $chr:$beg-$end | cut -f2-4",verbose=>0);
+    for my $map_line (@map_lines)
+    {
+        my ($mbeg,$mend,$score) = split(/\t/,$map_line);
+        chomp($score);
+        if ( $mbeg < $beg ) { $mbeg = $beg; }
+        if ( $mend > $end ) { $mend = $end; }
+        $sum += $score*($mend-$mbeg);
+        $len += $mend - $mbeg;
+    }
+    return $len ? sprintf("%.2f",$sum/$len) : 0;
+}
+sub feature_gc
+{
+    my ($self,$smpl,$chr,$beg,$end) = @_;
+    if ( !exists($$self{smpl2info}{$smpl}) ) { $self->throw("No such sample in $$self{samples}: $smpl\n"); }
+    my $gc_file = $$self{smpl2info}{$smpl}{gc};
+    my @gc = $self->cmd("tabix $gc_file $chr:$beg-$end",verbose=>0);
+    my $ntot = 0;
+    my $ngc  = 0;
+    for my $line (@gc)
+    {
+        chomp($line);
+        my ($chr,$beg,$end,$gc) = split(/\t/,$line);
+        $ntot += $end - $beg + 1;
+        $ngc += ($end - $beg + 1) * $gc;
+    }
+    return sprintf("%.2f",$ntot ? $ngc/$ntot : 0);
+}
+sub cmp_smpl_chr_beg_end
+{
+    my ($a,$b) = @_;
+
+    my $ret = $$a[1] cmp $$b[1];
+    if ( $ret != 0 ) { return $ret; }
+
+    $ret = $$a[2] <=> $$b[2];
+    if ( $ret != 0 ) { return $ret; }
+
+    $ret = $$a[3] <=> $$b[3];
+    if ( $ret != 0 ) { return $ret; }
+
+    $ret = $$a[0] cmp $$b[0];
+    if ( $ret != 0 ) { return $ret; }
+
+    return $ret;
+}
+sub compare_scores
+{
+    my ($self,$outfile,$ori_fname,$new_fname) = @_;
+    my ($ori_cols) = $self->col_names($ori_fname);
+    my ($new_cols) = $self->col_names($new_fname);
+    my @ori_col = (); for my $col (qw(smpl chr beg end RandomForestScore)) { push @ori_col,$$ori_cols{$col}+1; }
+    my @new_col = (); for my $col (qw(smpl chr beg end RandomForestScore)) { push @new_col,$$new_cols{$col}+1; }
+    for (my $i=1; $i<@ori_col; $i++) { if($ori_col[$i-1]>=$ori_col[$i]){$self->throw("Uh\n");} }
+    for (my $i=1; $i<@new_col; $i++) { if($new_col[$i-1]>=$new_col[$i]){$self->throw("Uh\n");} }
+    my $ori_cmd = "gunzip -c $ori_fname | grep -v ^# | cut -f ".join(',',@ori_col)." | sort -k2,2d -k3,3n -k4,4n -k1,1d";
+    my $new_cmd = "gunzip -c $new_fname | grep -v ^# | cut -f ".join(',',@new_col)." | sort -k2,2d -k3,3n -k4,4n -k1,1d";
+    open(my $ori_fh,"$ori_cmd |") or $self->throw("$ori_cmd: $!");
+    open(my $new_fh,"$new_cmd |") or $self->throw("$new_cmd: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: !");
+    my ($ori,$new);
+    while (1)
+    {
+        if ( !defined $ori ) { $ori = <$ori_fh>; }
+        if ( !defined $new ) { $new = <$new_fh>; }
+        if ( !defined $ori && !defined $new ) { last; }
+        if ( defined $ori && ref($ori) ne 'ARRAY' ) { $ori = [split(/\t/,$ori)]; chomp($$ori[-1]); }
+        if ( defined $new && ref($new) ne 'ARRAY' ) { $new = [split(/\t/,$new)]; chomp($$new[-1]); }
+        if ( defined $ori && defined $new )
+        {
+            my $ret = cmp_smpl_chr_beg_end($ori,$new);
+            if ( !$ret )
+            {
+                print $out join("\t",@$ori,$$new[-1])."\n";
+                $ori = undef;
+                $new = undef;
+            }
+            elsif ( $ret<0 )
+            {
+                print $out join("\t",@$ori,'.')."\n";
+                $ori = undef;
+            }
+            else
+            {
+                print $out join("\t",$$new[0],$$new[1],$$new[2],$$new[3],'.',$$new[4])."\n";
+                $new = undef;
+            }
+        }
+        elsif ( !defined $new )
+        {
+            print $out join("\t",@$ori,'.')."\n";
+            $ori = undef;
+        }
+        else
+        {
+            print $out join("\t",$$new[0],$$new[1],$$new[2],$$new[3],'.',$$new[4])."\n";
+            $new = undef;
+        }
+    }
+    close($ori_fh) or $self->throw("close failed: $ori_cmd");
+    close($new_fh) or $self->throw("close failed: $new_cmd");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub plot_scores
+{
+    my ($self,$outfile,$dat,$args) = @_;
+    my ($cols,$iscore) = $self->col_names($dat,'RandomForestScore'); $iscore++;
+    $self->cmd(qq[zcat $dat | grep -v ^# | cut -f $iscore | stats h -s 0.02 | cut -f2,3 | mplot barplot -F -o $outfile +type x-cnt +sty mine $args +wd 0.02 +ysci -2,2 +wh 5,3.3 +adj top=0.85,bottom=0.17,right=0.95 +yl 'Number of calls' +xl 'Random forest score' +smooth 11 +line '0.95,0,0.95,8e4;color=#242424;lw=2;ls=:']);
+}
+

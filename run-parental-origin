@@ -1,0 +1,980 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}  = 1;
+    $$self{bcftools}         = 'bcftools';
+    $$self{bcftools_plugins} = 'plugins/';
+    $$self{vcf_smpl}     = 'vcf-smpl.txt';
+    $$self{trio_samples} = 'ddd-samples.ped';
+    $$self{Rscript}      = 'Rscript';
+    $$self{Renv}         = '';
+    $$self{max_af}       = 0;       # maximum AF_parent
+    $$self{min_qual}     = 5;       # minimum parental origin quality
+    $$self{annots}       = 'fine-0.95.annot.txt.gz';
+    $$self{annot_regs}   = 'annot-regs';
+    $$self{bams}         = 'ddd-exome-bams.sample.txt';
+    $$self{crams}        = 'allDDD_Source_CRAMs';
+    $$self{ref}          = 'hs37d5.fa';
+    $$self{parental_age} = { fname=>'phenotypes_and_patient_info.txt', mothers=>6, fathers=>7 };
+
+    $$self{debug_recall} = 0; # old branch: recalls variants by mpileup
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: Take a list of CNVs and check if ther parental origin\n" .
+        "Usage: run-parental-origin\n" .
+        "Options:\n" .
+        "   -C, --call <type,smpl,chr,beg,end>  Run for this one sample: sample,chr,beg,end\n" .
+        "   -c, --calls <file>                  Calls to analyze. Required columns: type,sample,chr,beg,end\n" .
+        "   -f, --filter <af,qual>              Re-evaluate with the provided maximum AF_Parent and minimum quality cut-off [$$self{max_af},$$self{min_qual}]\n" .
+        "   -o, --outdir <dir>                  Output directory\n" .
+        "   -v, --vcf-smpl <list>               List of vcfs and samples, space delimited: vcf smpl\n" .
+        "   -X, --no-chrX                       Exclude chrX calls\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-C' or $arg eq '--call' ) { $$self{call}=shift(@ARGV); next; }
+        if ( $arg eq '-c' or $arg eq '--calls' ) { push @{$$self{calls}},shift(@ARGV); next; }
+        if ( $arg eq '-f' or $arg eq '--filter' ) { ($$self{max_af},$$self{min_qual}) = split(/,/,shift(@ARGV)); $$self{filter}=1; next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        if ( $arg eq '-v' or $arg eq '--vcfs' ) { $$self{vcfs}=shift(@ARGV); next; }
+        if ( $arg eq '-X' or $arg eq '--no-chrX' ) { $$self{no_chrX}=1; next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( !exists($$self{calls}) && !exists($$self{call}) ) { $self->throw("Expected the -c or -C option."); }
+    $self->parse_ped($$self{trio_samples});
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    # Validation using WGS and SNP array data:
+    #   $self->spawn('parental_origin_manual_test_wgs',"$$self{outdir}/manual-test-wgs");
+    #   $self->spawn('parental_origin_manual_test_snp',"$$self{outdir}/manual-test-snp");
+    #   $self->wait;
+    #   $self->all_done;
+
+    my $jobs = $self->read_jobs();
+    for my $job (@$jobs)
+    {
+        $self->spawn('parental_origin',$$job{outfile},$job);
+    }
+    $self->wait;
+
+    $self->spawn('merge_jobs',"$$self{outdir}/merged.txt",$jobs);
+    $self->wait;
+
+    if ( $$self{filter} ) { $self->cmd("rm -rf $$self{outdir}/pvals.txt"); }
+    $self->spawn('evaluate',"$$self{outdir}/pvals.txt","$$self{outdir}/merged.txt");
+    $self->spawn('parental_age',"$$self{outdir}/age","$$self{outdir}/merged.txt");
+    $self->spawn('plot_origin',"$$self{outdir}/origin.png");
+    $self->wait;
+
+    $self->all_done;
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+sub parse_ped
+{
+    my ($self,$file) = @_;
+    my %ped = ();
+    open(my $in,'<',$file) or $self->throw("$file: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\s+/,$line);
+        chomp($col[-1]);
+        if ( $col[2] eq '0' or $col[3] eq '0' ) { next; }
+        $$self{trio}{$col[1]}{father} = $col[2];
+        $$self{trio}{$col[1]}{mother} = $col[3];
+    }
+    close($in) or $self->throw("close failed: $file");
+}
+sub read_jobs
+{
+    my ($self) = @_;
+    my @jobs = ();
+    my $smpl2vcf = {};
+
+    open(my $fh,'<',$$self{vcf_smpl}) or $self->throw("$$self{vcf_smpl}: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my ($vcf,$smpl) = split(/\s+/,$line);
+        if ( exists($$smpl2vcf{$smpl}) && $$smpl2vcf{$smpl} ne $vcf) { $self->throw("Duplicate sample: $smpl .. $vcf vs $$smpl2vcf{$smpl}"); }
+        $$smpl2vcf{$smpl} = $vcf;
+    }
+    close($fh) or $self->throw("close failed: $$self{vcf_smpl}");
+
+    my $calls = exists($$self{calls}) ? $$self{calls} : [];
+    for my $file (@$calls)
+    {
+        my ($cols,$itype,$ichr,$ibeg,$iend,$ismpl,$iaf) = $self->col_names($file,qw(type chr beg end smpl AF_parents));
+        open(my $fh,"zless $file |") or $self->throw("zless $file: $!");
+        while (my $line=<$fh>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            chomp($line);
+            my @col = split(/\t/,$line);
+            my $type = $col[$itype];
+            my $smpl = $col[$ismpl];
+            my $chr  = $col[$ichr];
+            my $beg  = $col[$ibeg];
+            my $end  = $col[$iend];
+            my $af   = $col[$iaf];
+            if ( $$self{no_chrX} && $chr eq 'X' ) { next; }
+            if ( !exists($$smpl2vcf{$smpl}) ) { $self->throw("No VCF for $smpl\n".Dumper($smpl2vcf)); }
+            push @jobs,{type=>$type, smpl=>$smpl, chr=>$chr, beg=>$beg, end=>$end, af=>$af, vcf=>$$smpl2vcf{$smpl}};
+        }
+        close($fh) or $self->throw("close failed: zless $file");
+    }
+    if ( exists($$self{call}) )
+    {
+        my $splt = $$self{call}=~/,/ ? ',' : ';';
+        my ($type,$smpl,$chr,$beg,$end) = split(/$splt/,$$self{call});
+        if ( !exists($$smpl2vcf{$smpl}) ) { $self->throw("No VCF for $smpl\n"); }
+        push @jobs,{type=>$type, smpl=>$smpl, chr=>$chr, beg=>$beg, end=>$end, vcf=>$$smpl2vcf{$smpl}};
+    }
+
+    my %smpl2cram = ();
+    my %smpl2bam  = ();
+    if ( $$self{debug_recall} )
+    {
+        for my $line ($self->cmd(qq[cat $$self{crams}]))
+        {
+            chomp($line);
+            if ( !($line=~m{/([^/]+)\.cram$}) ) { $self->throw("Could not parse: $line"); }
+            my $smpl = $1;
+            $smpl2cram{$smpl} = $line;
+        }
+        for my $line ($self->cmd(qq[cat $$self{bams}]))
+        {
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            $smpl2bam{$col[1]} = $col[0];
+            $smpl2bam{$col[2]} = $col[0];
+            if ( !exists($smpl2cram{$col[1]}) ) { $self->throw("No cram for $col[1]?"); }
+            $smpl2cram{$col[2]} = $smpl2cram{$col[1]};
+        }
+    }
+
+    for my $job (@jobs)
+    {
+        if ( !exists($$self{trio}{$$job{smpl}}) ) { $self->throw("No trio for $$job{smpl} in $$self{trio_samples}\n"); }
+        my $smpl   = $$job{smpl};
+        my $father = $$self{trio}{$smpl}{father};
+        my $mother = $$self{trio}{$smpl}{mother};
+        $$job{father} = $father;
+        $$job{mother} = $mother;
+        if ( $$self{debug_recall} )
+        {
+            if ( !exists($smpl2bam{$smpl}) ) { $self->throw("no bam for $smpl\n"); }
+            if ( !exists($smpl2bam{$father}) ) { $self->throw("no bam for $father\n"); }
+            if ( !exists($smpl2bam{$mother}) ) { $self->throw("no bam for $mother\n"); }
+            $$job{bam_pfm} = [$smpl2bam{$smpl},$smpl2bam{$father},$smpl2bam{$mother}];
+            $$job{cram_pfm} = [$smpl2cram{$smpl},$smpl2cram{$father},$smpl2cram{$mother}];
+        }
+    }
+    for (my $i=0; $i<@jobs; $i++)
+    {
+        $jobs[$i]{outfile} = "$$self{outdir}/jobs/$i.txt";
+    }
+    return \@jobs;
+}
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+sub hom_rate
+{
+    my ($self,$vcf,$smpl,$reg) = @_;
+    my $nhet = 0;
+    my $nhom = 0;
+    for my $gt (grep {chomp} $self->cmd(qq[$$self{bcftools} query -f'[%GT]\\n' -s $smpl -r $reg $vcf]))
+    {
+        my %gt = map { $_=>1 } split(m{/},$gt);
+        if ( exists($gt{'.'}) ) { next; }
+        if ( scalar keys %gt == 1 ) { $nhom++; }
+        else { $nhet++; }
+    }
+    return $nhet+$nhom ? sprintf("%.2f",$nhom/($nhom+$nhet)) : 0;
+}
+sub naive_prediction
+{
+    my ($self,%args) = @_;
+    if ( lc($args{type}) eq 'dup' ) { return ('n/a',0,0,0,0,0); }
+
+    my $i = 0;
+    my %smpl = map { $_=>$i++ } grep { chomp } $self->cmd(qq[$$self{bcftools} query -l $args{vcf}]);
+    my $iprob = $smpl{$args{proband}};
+    my $ifat  = $smpl{$args{father}};
+    my $imot  = $smpl{$args{mother}};
+
+    my $hr_reg = $self->hom_rate($args{vcf},$args{proband},$args{reg});
+    my $hr_fat = $self->hom_rate($args{vcf},$args{father},'X');
+    my $hr_mot = $self->hom_rate($args{vcf},$args{mother},'X');
+
+    my $cmd = qq[$$self{bcftools} view $args{vcf} -r $args{reg} -i'GT[$iprob]=="hom" && (GT[$ifat]=="hom" || GT[$imot]=="hom")' | $$self{bcftools} query -f '%POS[\\t%GT]\\n' -s $args{proband},$args{mother},$args{father}];
+    my @out = grep { chomp } $self->cmd($cmd);
+    my $nfat = 0;
+    my $nmot = 0;
+    for my $line (@out)
+    {
+        my @col = split(/\t/,$line);
+        my %prob = map {$_=>1} split(m{/},$col[1]);
+        my %mot  = map {$_=>1} split(m{/},$col[2]);
+        my %fat  = map {$_=>1} split(m{/},$col[3]);
+        if ( exists($prob{'.'}) or exists($mot{'.'}) or exists($fat{'.'}) ) { next; }
+        if ( scalar keys %prob != 1 ) { $self->throw("Proband not a hom: $line"); }
+        my $al = (keys %prob)[0];
+        if ( exists($mot{$al}) && exists($fat{$al}) ) { next; }
+        if ( exists($mot{$al}) ) { $nmot++; }
+        if ( exists($fat{$al}) ) { $nfat++; }
+    }
+    my $origin = 'uncertain';
+    my $frac = 0;
+    if ( $nfat > $nmot ) { $origin = 'maternal'; $frac = $nfat/($nfat+$nmot); }
+    elsif ( $nfat < $nmot ) { $origin = 'paternal'; $frac = $nmot/($nfat+$nmot); }
+    return ($origin,sprintf("%.2f",$frac),$nfat+$nmot,$hr_reg,$hr_fat,$hr_mot);
+}
+sub guess_sex
+{
+    my ($self,$multicov) = @_;
+    my $cov7 = (grep {chomp} $self->cmd(qq[tabix $multicov 7 | awk '{s+=1.0*\$4/(\$3-\$2+1);n++}END{print 1.0*s/n}']))[0];
+    my $covX = (grep {chomp} $self->cmd(qq[tabix $multicov X | awk '{s+=1.0*\$4/(\$3-\$2+1);n++}END{print 1.0*s/n}']))[0];
+    return $covX/$cov7;
+}
+sub recall_parental_origin
+{
+    my ($self,$outdir,$job) = @_;
+    my $sex_smpl = $self->guess_sex("$$job{bam_pfm}[0].multicov.gz");
+    my $sex_fath = $self->guess_sex("$$job{bam_pfm}[1].multicov.gz");
+    my $sex_moth = $self->guess_sex("$$job{bam_pfm}[2].multicov.gz");
+
+    my $reg_ext = sprintf("%s:%d-%d", $$job{chr},$$job{beg}-1e6>0 ? $$job{beg}-1e6 : 1, $$job{end}+1e6);
+    my $cmd = 
+        qq[mkdir -p $outdir && ] .
+        qq[$$self{bcftools} mpileup -f $$self{ref} -I -r $reg_ext $$job{cram_pfm}[0] $$job{cram_pfm}[1] $$job{cram_pfm}[2] -a FORMAT/AD,FORMAT/DP -Ou | ] .
+        qq[$$self{bcftools} call -mv -Ob -o $outdir/calls.bcf && $$self{bcftools} index $outdir/calls.bcf];
+    $self->cmd($cmd);
+
+    my @smpl = grep {chomp} $self->cmd(qq[$$self{bcftools} query -l $outdir/calls.bcf]);    # proband,father,mother
+    my $mfc = "$smpl[2],$smpl[1],$smpl[0]";
+    my $cfm = "$smpl[0],$smpl[1],$smpl[2]";
+    my @out = grep { chomp } $self->cmd(
+        qq[$$self{bcftools} view $outdir/calls.bcf -e 'FORMAT/DP<15' -Ou | ] .
+        qq[$$self{bcftools} +mendelian -t $mfc -c]
+    );
+    @out = split(/\t/,$out[-1]);
+    my $nerr = $out[0]+$out[1] ? $out[1]/($out[0]+$out[1]): 0;
+
+    @out = grep { chomp } $self->cmd(
+        qq[$$self{bcftools} view $outdir/calls.bcf -e 'FORMAT/DP<15' -Ou -r $$job{chr}:$$job{beg}-$$job{end} | ] .
+        qq[$$self{bcftools} +parental-origin -t $$job{type} -p $cfm ]
+    );
+    @out = split(/\t/,$out[-1]);
+    return (nerr=>$nerr,origin=>$out[1],qual=>$out[2],nmarker=>$out[3],sex_smpl=>$sex_smpl,sex_fath=>$sex_fath,sex_moth=>$sex_moth);
+}
+sub parental_origin_debug_recall
+{
+    my ($self,$outfile,$job) = @_;
+
+    if ( !($outfile=~m{\.[^\.]+$}) ) { $self->throw("Could not parse: $outfile"); }
+    my $dir = $`;
+    my %po2 = $self->recall_parental_origin($dir,$job);
+
+    my %smpl = map { $_=>1 } grep { chomp } $self->cmd(qq[$$self{bcftools} query -l $$job{vcf}]);
+    my $smpl = $$job{smpl};
+    my $fat  = $$self{trio}{$smpl}{father};
+    my $mat  = $$self{trio}{$smpl}{mother};
+    if ( !exists($smpl{$fat}) ) { $self->throw("Father $fat not in $$job{vcf}\n"); }
+    if ( !exists($smpl{$mat}) ) { $self->throw("Mother $mat not in $$job{vcf}\n"); }
+
+    my $cmd = qq[$$self{bcftools} +parental-origin -t $$job{type} -p $smpl,$fat,$mat -r $$job{chr}:$$job{beg}-$$job{end} $$job{vcf}];
+    $self->cmd("$cmd > $outfile.part");
+
+    my ($origin,$frac,$nmarker,$hr_reg,$hr_fat,$hr_mot) = $self->naive_prediction(type=>$$job{type},proband=>$smpl,father=>$fat,mother=>$mat,reg=>"$$job{chr}:$$job{beg}-$$job{end}",vcf=>$$job{vcf});
+
+    open(my $fh,'>>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    print $fh join("\t",'naive',$origin,$frac,$nmarker,$hr_reg,$hr_fat,$hr_mot)."\n";
+    print $fh join("\t",'ori2',$po2{nerr},$po2{origin},$po2{qual},$po2{nmarker},$po2{sex_smpl},$po2{sex_fath},$po2{sex_moth})."\n";
+    close($fh) or $self->throw("close failed: $outfile.part");
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub parental_origin
+{
+    my ($self,$outfile,$job) = @_;
+    if ( defined($$self{bcftools_plugins}) ) { $ENV{BCFTOOLS_PLUGINS} = $$self{bcftools_plugins}; }
+
+    if ( $$self{debug_recall} ) { $self->parent_origin_debug_recall($outfile,$job); return; }
+
+    my %smpl = map { $_=>1 } grep { chomp } $self->cmd(qq[$$self{bcftools} query -l $$job{vcf}]);
+    my $smpl = $$job{smpl};
+    my $fat  = $$self{trio}{$smpl}{father};
+    my $mat  = $$self{trio}{$smpl}{mother};
+    if ( !exists($smpl{$fat}) ) { $self->throw("Father $fat not in $$job{vcf}\n"); }
+    if ( !exists($smpl{$mat}) ) { $self->throw("Mother $mat not in $$job{vcf}\n"); }
+
+    my $cmd = qq[$$self{bcftools} +parental-origin -t $$job{type} -p $smpl,$fat,$mat -r $$job{chr}:$$job{beg}-$$job{end} $$job{vcf}];
+    $self->cmd("$cmd > $outfile.part");
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub merge_jobs_debug_recall
+{
+    my ($self,$outfile,$jobs) = @_;
+    open(my $fh,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    my @cols = (qw(chr beg end smpl type origin1 origin2 origin3 qual qual3 mendel_errs frac2 nsites nmarker2 nmarker3 hom_rate_reg hom_rate_father hom_rate_mother sex_smpl sex_fath sex_moth af vcf job));
+    my @hdr  = ();
+    for (my $i=0; $i<@cols; $i++) { push @hdr,sprintf("[%d]%s",$i+1,$cols[$i]); }
+    print $fh '#'.join("\t",@hdr)."\n";
+    for my $job (@$jobs)
+    {
+        my @out = grep {chomp} $self->cmd("cat $$job{outfile} | grep -v ^#");
+        my ($type,$origin1,$qual,$nsites) = split(/\t/,$out[0]);
+        my (undef,$origin2,$frac,$nmarker,$hr_reg,$hr_fat,$hr_mot) = split(/\t/,$out[1]);
+        my (undef,$mendel,$origin3,$qual3,$nmarker3,$sex_smpl3,$sex_fath3,$sex_moth3) = split(/\t/,$out[2]);
+        print $fh join("\t",$$job{chr},$$job{beg},$$job{end},$$job{smpl},$$job{type},$origin1,$origin2,$origin3,$qual,$qual3,$mendel,$frac,$nsites,$nmarker,$nmarker3,$hr_reg,$hr_fat,$hr_mot,$sex_smpl3,$sex_fath3,$sex_moth3,$$job{af},$$job{vcf},$$job{outfile})."\n";
+    }
+    close($fh) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub merge_jobs
+{
+    my ($self,$outfile,$jobs) = @_;
+    if ( $$self{debug_recall} ) { $self->merge_jobs_debug_recall($outfile,$jobs); return; }
+
+    open(my $fh,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    my @cols = (qw(chr beg end smpl type origin qual markers af vcf job));
+    my @hdr  = ();
+    for (my $i=0; $i<@cols; $i++) { push @hdr,sprintf("[%d]%s",$i+1,$cols[$i]); }
+    print $fh '#'.join("\t",@hdr)."\n";
+    for my $job (@$jobs)
+    {
+        if ( $$job{chr} eq 'X' && $$self{no_chrX}  ) { next; }
+        my $out = (grep {chomp} $self->cmd("cat $$job{outfile} | grep -v ^#"))[0];
+        my ($type,$origin,$qual,$nsites) = split(/\t/,$out);
+        print $fh join("\t",$$job{chr},$$job{beg},$$job{end},$$job{smpl},$$job{type},$origin,$qual,$nsites,$$job{af},$$job{vcf},$$job{outfile})."\n";
+    }
+    close($fh) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub evaluate
+{
+    my ($self,$outfile,$infile) = @_;
+    my $cnt_chr = {};
+    for my $chr (qw(X A)) { for my $type (qw(DEL DUP)) { for my $orig (qw(paternal maternal)) { $$cnt_chr{"$chr-$type-$orig"} = 0; } } }
+
+    my $cnt = {};
+    my ($cols,$ichr,$ibeg,$iend,$itype,$iorig,$iqual,$iaf) = $self->col_names($infile,qw(chr beg end type origin qual af));
+    my $cmd = qq[$$self{annot_regs} -s $$self{annots} -d $infile -m type,smpl -t ndd_genes];
+    print STDERR "$cmd\n";
+    open(my $fh,"$cmd |") or $self->throw("$cmd: $!");
+    while (my $line=<$fh>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $type  = $col[$itype];
+        my $orig  = $col[$iorig];
+        my $qual  = $col[$iqual];
+        my $af    = $col[$iaf];
+        my $beg   = $col[$ibeg];
+        my $end   = $col[$iend];
+        my $chr   = $col[$ichr];
+        if ( $qual < $$self{min_qual} ) { $$cnt{skip}++; next; }
+
+        my $size = $end - $beg + 1;
+        if ( $size<1e6 ) { $$cnt{small}{$type}{$orig}++; }
+        else { $$cnt{big}{$type}{$orig}++; }
+
+        $chr = $chr eq 'X' ? 'X' : 'A';
+        $$cnt_chr{"$chr-$type-$orig"}++;
+
+        $$cnt{$type}{$orig}++;
+    }
+    close($fh) or $self->throw("close failed: $cmd");
+
+    my $ndup_pat = exists($$cnt{DUP}{paternal}) ? $$cnt{DUP}{paternal} : 0;
+    my $ndup_mat = exists($$cnt{DUP}{maternal}) ? $$cnt{DUP}{maternal} : 0;
+    my $ndel_pat = exists($$cnt{DEL}{paternal}) ? $$cnt{DEL}{paternal} : 0;
+    my $ndel_mat = exists($$cnt{DEL}{maternal}) ? $$cnt{DEL}{maternal} : 0;
+    my $nsmall_dup_pat = exists($$cnt{small}{DUP}{paternal}) ? $$cnt{small}{DUP}{paternal} : 0;
+    my $nsmall_dup_mat = exists($$cnt{small}{DUP}{maternal}) ? $$cnt{small}{DUP}{maternal} : 0;
+    my $nsmall_del_pat = exists($$cnt{small}{DEL}{paternal}) ? $$cnt{small}{DEL}{paternal} : 0;
+    my $nsmall_del_mat = exists($$cnt{small}{DEL}{maternal}) ? $$cnt{small}{DEL}{maternal} : 0;
+    my $nbig_dup_pat = exists($$cnt{big}{DUP}{paternal}) ? $$cnt{big}{DUP}{paternal} : 0;
+    my $nbig_dup_mat = exists($$cnt{big}{DUP}{maternal}) ? $$cnt{big}{DUP}{maternal} : 0;
+    my $nbig_del_pat = exists($$cnt{big}{DEL}{paternal}) ? $$cnt{big}{DEL}{paternal} : 0;
+    my $nbig_del_mat = exists($$cnt{big}{DEL}{maternal}) ? $$cnt{big}{DEL}{maternal} : 0;
+
+    my $datfile = "$$self{outdir}/barplot.txt";
+    open($fh,'>',"$datfile") or $self->throw("$datfile: $!");
+    printf $fh "Paternal origin\tAll\t%d\n",$ndel_pat+$ndup_pat;
+    printf $fh "Maternal origin\tAll\t%d\n",$ndel_mat+$ndup_mat;
+    print $fh "Paternal origin\tLosses\t$ndel_pat\n";
+    print $fh "Maternal origin\tLosses\t$ndel_mat\n";
+    print $fh "Paternal origin\tGains\t$ndup_pat\n";
+    print $fh "Maternal origin\tGains\t$ndup_mat\n";
+    printf $fh "Paternal origin\t<1Mb\t%d\n", $nsmall_del_pat + $nsmall_dup_pat;
+    printf $fh "Maternal origin\t<1Mb\t%d\n", $nsmall_del_mat + $nsmall_dup_mat;
+    printf $fh "Paternal origin\t>1Mb\t%d\n", $nbig_del_pat + $nbig_dup_pat;
+    printf $fh "Maternal origin\t>1Mb\t%d\n", $nbig_del_mat + $nbig_dup_mat;
+    close($fh) or $self->throw("close failed: $datfile");
+
+    my $pall   = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($ndup_pat+$ndel_pat,$ndup_mat+$ndel_mat),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+    my $pdup   = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($ndup_pat,$ndup_mat),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+    my $pdel   = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($ndel_pat,$ndel_mat),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+    my $psmall = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($nsmall_dup_pat+$nsmall_del_pat,$nsmall_dup_mat+$nsmall_del_mat),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+    my $pbig   = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($nbig_dup_pat+$nbig_del_pat,$nbig_dup_mat+$nbig_del_mat),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+    my $pall_X = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($$cnt_chr{'X-DUP-paternal'}+$$cnt_chr{'X-DEL-paternal'},$$cnt_chr{'X-DUP-maternal'}+$$cnt_chr{'X-DEL-maternal'}),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+    my $pall_A = (grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'binom.test(c($$cnt_chr{'A-DUP-paternal'}+$$cnt_chr{'A-DEL-paternal'},$$cnt_chr{'A-DUP-maternal'}+$$cnt_chr{'A-DEL-maternal'}),a="t")\$p.value' | sed 's,^.*\\s\\s*,,']))[0];
+
+    # my $pall_prn = sprintf("%.2f",$pall);
+    # my $ypos = ($ndup_pat+$ndel_pat > $ndup_mat+$ndel_mat ? $ndup_pat+$ndel_pat : $ndup_mat+$ndel_mat)*1.02;
+    # +ann  '"txt":"p=$pall_prn","x":0.9,"y":$ypos,"ha":"center","va":"bottom","fontsize":9'
+    
+    $self->cmd(qq[cat $datfile | \\
+        mplot barstack +type bar-xlbl-cnt -F -o $$self{outdir}/barplot.png,pdf,svgz \\
+            +cl '#f4640d,#69ad2f' +yl 'Number of CNVs' +sty mine \\
+            +wh 5,2.3 +adj left=0.13,bottom=0.1,right=0.98,top=0.90 \\
+            +la rotation=0,y=-0.01 -d tab +sp 0.2 \\
+            +hdt 1 +ec none +dpi 150 \\
+            +title 'Parental origin' +ta y=0.9 \\
+            +bh '"type":"int","va":"bottom","ha":"center","fontsize":8'
+        ]);
+
+    open($fh,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    print $fh '#'.join("\t",qw(type npat nmat pval))."\n";
+    printf $fh "all\t%d\t%d\t$pall\n", $ndup_pat+$ndel_pat, $ndup_mat+$ndel_mat;
+    printf $fh "all_X\t%d\t%d\t$pall_X\n", $$cnt_chr{'X-DUP-paternal'}+$$cnt_chr{'X-DEL-paternal'},$$cnt_chr{'X-DUP-maternal'}+$$cnt_chr{'X-DEL-maternal'};
+    printf $fh "all_A\t%d\t%d\t$pall_A\n", $$cnt_chr{'A-DUP-paternal'}+$$cnt_chr{'A-DEL-paternal'},$$cnt_chr{'A-DUP-maternal'}+$$cnt_chr{'A-DEL-maternal'};
+    print $fh "dup\t$ndup_pat\t$ndup_mat\t$pdup\n";
+    print $fh "del\t$ndel_pat\t$ndel_mat\t$pdel\n";
+    printf $fh "<1Mb\t%d\t%d\t$psmall\n", $nsmall_dup_pat+$nsmall_del_pat, $nsmall_dup_mat+$nsmall_del_mat;
+    printf $fh ">1Mb\t%d\t%d\t$pbig\n", $nbig_dup_pat+$nbig_del_pat, $nbig_dup_mat+$nbig_del_mat;
+    close($fh) or $self->throw("close failed: $outfile.part");
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub parental_origin_manual_test_wgs
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my $job = 
+    {
+        type    => 'DUP',
+        chr     => '5',
+        beg     => XXXXXXXX,
+        end     => XXXXXXXX, 
+        smpl    => 'XXXXXXXXXXXXXXX',
+        father  => 'DDXXXXXXXXXXXXX',
+        mother  => 'DDXXXXXXXXXXXXX',
+        bam_pfm => 
+        [
+            'proband.bam',
+            'father.bam',
+            'mother.bam',
+        ],
+    };
+    if ( !$self->is_finished("$dir/sex.txt") )
+    {
+        my $sex_fat = $self->guess_sex_bam($$job{bam_pfm}[1]);
+        my $sex_mot = $self->guess_sex_bam($$job{bam_pfm}[2]);
+        open(my $fh,'>',"$dir/sex.txt.part") or $self->throw("$dir/sex.txt.part: $!");
+        printf $fh "%s\t%.2f\t%s\n",$$sex_fat{sex},$$sex_fat{ratio},$$job{bam_pfm}[1];
+        printf $fh "%s\t%.2f\t%s\n",$$sex_mot{sex},$$sex_mot{ratio},$$job{bam_pfm}[2];
+        close($fh) or $self->throw("close failed: $dir/sex.txt.part");
+        rename("$dir/sex.txt.part","$dir/sex.txt") or $self->throw("rename $dir/sex.txt.part $dir/sex.txt: $!");
+        if ( $$sex_fat{sex} ne 'M' ) { $self->throw("Different sex than expected: $dir/sex.txt"); }
+        if ( $$sex_mot{sex} ne 'F' ) { $self->throw("Different sex than expected: $dir/sex.txt"); }
+    }
+
+    if ( !$self->is_finished("$dir/calls.bcf.csi") )
+    {
+        my $reg_ext = sprintf("%s:%d-%d", $$job{chr},$$job{beg}-1e6>0 ? $$job{beg}-1e6 : 1, $$job{end}+1e6);
+        my $cmd = 
+            qq[$$self{bcftools} mpileup -f $$self{ref} -I -r $reg_ext $$job{bam_pfm}[0] $$job{bam_pfm}[1] $$job{bam_pfm}[2] -a FORMAT/AD,FORMAT/DP -Ou | ] .
+            qq[$$self{bcftools} call -mv -Ob -o $dir/calls.bcf && bcftools index $dir/calls.bcf];
+        $self->cmd($cmd);
+    }
+
+    if ( defined($$self{bcftools_plugins}) ) { $ENV{BCFTOOLS_PLUGINS} = $$self{bcftools_plugins}; }
+
+    my ($prob,$fat,$mot) = grep {chomp} $self->cmd(qq[$$self{bcftools} query -l $dir/calls.bcf]);
+    my $mfc = "$mot,$fat,$prob";
+    my $cfm = "$prob,$fat,$mot";
+    $self->cmd(qq[$$self{bcftools} view $dir/calls.bcf -e 'FORMAT/DP<15' -Ou | $$self{bcftools} +mendelian -t $mfc -c > $dir/mendelian.txt]);
+    $self->cmd(qq[$$self{bcftools} view $dir/calls.bcf -e 'FORMAT/DP<15' -Ou -r $$job{chr}:$$job{beg}-$$job{end} | $$self{bcftools} +parental-origin -t $$job{type} -p $cfm > $dir/parental.txt]);
+
+    rename($dir,$outdir) or $self->throw("rename $dir $outdir: $!");
+}
+sub guess_sex_bam
+{
+    my ($self,$bam) = @_;
+    my $n7 = (grep {chomp} $self->cmd(qq[samtools stats $bam 7 | grep '^SN\tsequences:' | awk '{print \$3}']))[0];
+    my $nX = (grep {chomp} $self->cmd(qq[samtools stats $bam X | grep '^SN\tsequences:' | awk '{print \$3}']))[0];
+    my $ratio = $n7/$nX;
+    my $sex = $ratio > 1.5 ? 'M' : 'F'; 
+    return {sex=>$sex,ratio=>$ratio};
+}
+sub guess_sex_vcf
+{
+    my ($self,$vcf,$smpl) = @_;
+    my $homrate = (grep {chomp} $self->cmd(qq[$$self{bcftools} view -s $smpl $vcf -r X | $$self{bcftools} query -i'GT="alt"' -f'[%GT\\n]' | awk '{x[\$1]++;}END{print x["1/1"]/(x["1/1"]+x["0/1"])}']))[0];
+    my $sex = $homrate > 0.8 ? 'M' : 'F'; 
+    return {sex=>$sex,ratio=>$homrate};
+}
+
+sub parental_origin_manual_test_snp
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my $cnv = {};
+    my ($cols,$itype,$ichr,$ibeg,$iend,$ismpl) = $self->col_names($$self{annots},qw(type chr beg end smpl));
+    open(my $fh,"gunzip -c $$self{annots} |") or $self->throw("gunzip -c $$self{annots}: $!");
+    while (my $line=<$fh>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        chomp($line);
+        my @col = split(/\t/,$line);
+        my $type = $col[$itype];
+        my $smpl = $col[$ismpl];
+        my $chr  = $col[$ichr];
+        my $beg  = $col[$ibeg];
+        my $end  = $col[$iend];
+        push @{$$cnv{$smpl}},{type=>$type, smpl=>$smpl, chr=>$chr, beg=>$beg, end=>$end};
+    }
+    close($fh) or $self->throw("close failed: gunzip -c $$self{annots}");
+
+    my @jobs = ();
+    for my $vcf (@vcfs)
+    {
+        if ( !($vcf=~m{/([^-/]+)-([^-/]+)-([^-/]+)\.vcf\.gz$}) ) { $self->throw("Could not parse: $vcf"); }
+        my $smpl = $1;
+        my $fath = $2;
+        my $moth = $3;
+        if ( !exists($$cnv{$smpl}) ) { $self->throw("Unexpected: no CNV for sample $smpl\n"); }
+        for my $cnv (@{$$cnv{$smpl}})
+        {
+            $$cnv{father} = $fath;
+            $$cnv{mother} = $moth;
+            $$cnv{vcf}    = $vcf;
+            push @jobs, $cnv;
+        }
+    }
+
+    if ( defined($$self{bcftools_plugins}) ) { $ENV{BCFTOOLS_PLUGINS} = $$self{bcftools_plugins}; }
+
+    for my $job (@jobs)
+    {
+        my $sdir = "$dir/$$job{smpl}-$$job{chr}-$$job{beg}-$$job{end}";
+        $self->cmd("mkdir -p $sdir");
+        if ( !$self->is_finished("$sdir/sex.txt") )
+        {
+            my $sex_fat = $self->guess_sex_vcf($$job{vcf},$$job{father});
+            my $sex_mot = $self->guess_sex_vcf($$job{vcf},$$job{mother});
+            open(my $fh,'>',"$sdir/sex.txt.part") or $self->throw("$sdir/sex.txt.part: $!");
+            printf $fh "%s\t%.2f\t%s\n",$$sex_fat{sex},$$sex_fat{ratio},$$job{vcf},$$job{father};
+            printf $fh "%s\t%.2f\t%s\n",$$sex_mot{sex},$$sex_mot{ratio},$$job{vcf},$$job{mother};
+            close($fh) or $self->throw("close failed: $sdir/sex.txt.part");
+            rename("$sdir/sex.txt.part","$sdir/sex.txt") or $self->throw("rename $sdir/sex.txt.part $sdir/sex.txt: $!");
+            if ( $$sex_fat{sex} ne 'M' ) { $self->throw("Different sex than expected: $sdir/sex.txt"); }
+            if ( $$sex_mot{sex} ne 'F' ) { $self->throw("Different sex than expected: $sdir/sex.txt"); }
+        }
+
+        my $mfc = "$$job{mother},$$job{father},$$job{smpl}";
+        my $cfm = "$$job{smpl},$$job{father},$$job{mother}";
+        $self->cmd(qq[$$self{bcftools} view $$job{vcf} -Ou | $$self{bcftools} +mendelian -t $mfc -c > $sdir/mendelian.txt]);
+        $self->cmd(qq[$$self{bcftools} view $$job{vcf} -Ou -r $$job{chr}:$$job{beg}-$$job{end} | $$self{bcftools} +parental-origin -t $$job{type} -p $cfm > $sdir/parental.txt]);
+
+    }
+    rename($dir,$outdir) or $self->throw("rename $dir $outdir: $!");
+}
+sub parental_age
+{
+    my ($self,$outdir,$infile) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my $m_max_age = 60;
+    my $f_max_age = 170;
+    my $nquants = 8;
+
+    my ($ismpl,$ifathers,$imothers,$itype,$iorig,$iqual);
+
+    my $smpl2ndnm = {};
+    my %smpl2age = ();
+    my %age2npop = ();
+    (undef,$ismpl,$ifathers,$imothers) = $self->col_names($$self{parental_age}{fname},qw(patient_id fathers_age mothers_age)); $ismpl++;
+    my $cmd = qq[cat $$self{parental_age}{fname} | rename-ddd-samples -c $ismpl -t person_stable_id];
+    open(my $fh,"$cmd |") or $self->throw("$cmd: $!");
+    while (my $line=<$fh>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $f_age = $col[$ifathers];
+        my $m_age = $col[$imothers];
+        my $smpl  = $col[$ismpl-1];
+        if ( $smpl eq 'patient_id' ) { next; }
+
+        $smpl2age{$smpl}{mothers} = $m_age;
+        $smpl2age{$smpl}{fathers} = $f_age;
+        if ( $m_age=~/^\d+$/ && $m_age <= $m_max_age ) { $age2npop{mothers}{$m_age}++; }
+        if ( $f_age=~/^\d+$/ && $f_age <= $f_max_age ) { $age2npop{fathers}{$f_age}++; }
+
+        $$smpl2ndnm{$smpl}{'DEL-nMat'} = 0;
+        $$smpl2ndnm{$smpl}{'DEL-nPat'} = 0;
+        $$smpl2ndnm{$smpl}{'DEL-nUnc'} = 0;
+        $$smpl2ndnm{$smpl}{'DUP-nMat'} = 0;
+        $$smpl2ndnm{$smpl}{'DUP-nPat'} = 0;
+        $$smpl2ndnm{$smpl}{'DUP-nUnc'} = 0;
+    }
+    close($fh) or $self->throw("close failed: $cmd");
+
+    my $nknown  = 0;
+    my $nunctn  = 0;
+    my %age2nsmpl = ();
+    (undef,$ismpl,$itype,$iorig,$iqual) = $self->col_names($infile,qw(smpl type origin qual));
+    open(my $in,"zless $infile |") or $self->throw("zless $infile: $!");
+    open(my $out,'>',"$dir/box.txt") or $self->throw("$dir/box.txt: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $type  = $col[$itype];
+        my $orig  = $col[$iorig];
+        my $qual  = $col[$iqual];
+        my $smpl  = $col[$ismpl];
+
+        if ( $smpl eq 'patient_id' ) { next; }
+        if ( $qual < $$self{min_qual} ) { $orig = 'uncertain'; }
+
+        if ( !exists($smpl2age{$smpl}) ) { $self->throw("Unknown age: $smpl\n"); }
+        my $m_age = $smpl2age{$smpl}{mothers};
+        my $f_age = $smpl2age{$smpl}{fathers};
+        if ( $orig eq 'maternal' && $m_age=~/^\d+$/ && $m_age <= $m_max_age )
+        {
+            print $out "mothers-$orig\t$m_age\n";
+            $age2nsmpl{mothers}{$m_age}++;
+            $nknown++;
+            $$smpl2ndnm{$smpl}{"$type-nMat"}++;
+        }
+        if ( $orig eq 'paternal' && $f_age=~/^\d+$/ && $f_age <= $f_max_age )
+        {
+            print $out "fathers-$orig\t$f_age\n";
+            $age2nsmpl{fathers}{$f_age}++;
+            $nknown++;
+            $$smpl2ndnm{$smpl}{"$type-nPat"}++;
+        }
+        if ( $orig eq 'uncertain' )
+        {
+            $$smpl2ndnm{$smpl}{"$type-nUnc"}++;
+            if ( $m_age=~/^\d+$/ && $m_age <= $m_max_age )
+            {
+                print $out "mothers-$orig\t$m_age\n";
+                $age2nsmpl{mothers_uncertain}{$m_age}++;
+                $nunctn++;
+            }
+            if ( $f_age=~/^\d+$/ && $f_age <= $f_max_age )
+            {
+                print $out "fathers-$orig\t$f_age\n";
+                $age2nsmpl{fathers_uncertain}{$f_age}++;
+                $nunctn++;
+            }
+        }
+    }
+    close($in) or $self->throw("close failed: zless $infile");
+    close($out) or $self->throw("close failed: $dir/box.txt");
+
+    open(my $raw,'>',"$dir/raw.txt") or $self->throw("$dir/raw.txt: $!");
+    print $raw "#[1]proband\t[2]nMat-DUP\t[3]nPat-DUP\t[4]nUnkn-DUP\t[5]nMat-DEL\t[6]nPat-DEL\t[7]nUnkn-DEL\t[8]ageMat\t[9]agePat\n";
+    for my $smpl (keys %$smpl2ndnm)
+    {
+        my $m_age = $smpl2age{$smpl}{mothers} ? $smpl2age{$smpl}{mothers} : 'Unknown';
+        my $f_age = $smpl2age{$smpl}{fathers} ? $smpl2age{$smpl}{fathers} : 'Unknown';
+        print $raw "$smpl\t$$smpl2ndnm{$smpl}{'DUP-nMat'}\t$$smpl2ndnm{$smpl}{'DUP-nPat'}\t$$smpl2ndnm{$smpl}{'DUP-nUnc'}\t$$smpl2ndnm{$smpl}{'DEL-nMat'}\t$$smpl2ndnm{$smpl}{'DEL-nPat'}\t$$smpl2ndnm{$smpl}{'DEL-nUnc'}\t$m_age\t$f_age\n";
+    }
+    close($raw) or $self->throw("close failed: $dir/raw.txt");
+
+    $self->run_glm_raw("$dir/raw.txt","$dir/raw");
+
+    my $m_quants = $self->_group_quantiles(nquantiles=>$nquants, key2cnt=>$age2npop{mothers});
+    my $f_quants = $self->_group_quantiles(nquantiles=>$nquants, key2cnt=>$age2npop{fathers});
+
+    open($out,'>',"$dir/rate-by-age.txt") or $self->throw("$dir/rate-by-age.txt: $!");
+    for my $grp_id (@{$$m_quants{ids}})
+    {
+        my $ngrp = $$m_quants{id2n}{$grp_id};
+        my $ncnv_known = 0;
+        my $ncnv_uncnt = 0;
+        for my $age (@{$$m_quants{id2list}{$grp_id}})
+        {
+            if ( exists($age2nsmpl{mothers}{$age}) ) { $ncnv_known += $age2nsmpl{mothers}{$age}; }
+            if ( exists($age2nsmpl{mothers_uncertain}{$age}) ) { $ncnv_uncnt += $age2nsmpl{mothers_uncertain}{$age}; }
+        }
+        printf $out "mothers\t%d\t%d\t%d\t%f\n",$grp_id,$ncnv_known,$ngrp,$ncnv_known/$ngrp*100*($nknown+$nunctn)/$nknown;
+        printf $out "mothers-uncertain\t%d\t%d\t%d\t%f\n",$grp_id,$ncnv_uncnt,$ngrp,$ncnv_uncnt/$ngrp*100*($nknown+$nunctn)/$nunctn;
+        printf $out "mothers-all\t%d\t%d\t%d\t%f\n",$grp_id,($ncnv_known+$ncnv_uncnt),$ngrp,($ncnv_known+$ncnv_uncnt)/$ngrp*100;
+    }
+    for my $grp_id (@{$$f_quants{ids}})
+    {
+        my $ngrp = $$f_quants{id2n}{$grp_id};
+        my $ncnv_known = 0;
+        my $ncnv_uncnt = 0;
+        for my $age (@{$$f_quants{id2list}{$grp_id}})
+        {
+            if ( exists($age2nsmpl{fathers}{$age}) ) { $ncnv_known += $age2nsmpl{fathers}{$age}; }
+            if ( exists($age2nsmpl{fathers_uncertain}{$age}) ) { $ncnv_uncnt += $age2nsmpl{fathers_uncertain}{$age}; }
+        }
+        printf $out "fathers\t%d\t%d\t%d\t%f\n",$grp_id,$ncnv_known,$ngrp,$ncnv_known/$ngrp*100*($nknown+$nunctn)/$nknown;
+        printf $out "fathers-uncertain\t%d\t%d\t%d\t%f\n",$grp_id,$ncnv_uncnt,$ngrp,$ncnv_uncnt/$ngrp*100*($nknown+$nunctn)/$nunctn;
+        printf $out "fathers-all\t%d\t%d\t%d\t%f\n",$grp_id,($ncnv_known+$ncnv_uncnt),$ngrp,($ncnv_known+$ncnv_uncnt)/$ngrp*100;
+    }
+
+    close($out) or $self->throw("close failed: $dir/rate-by-age.txt");
+
+
+    # DDD SNV mutation rate beta:
+    #       mage  0.016041
+    #       fage  0.031928
+
+    $self->cmd(qq[cat $dir/rate-by-age.txt | awk '\$1~/fathers-all/' | cut -f2,4,5 | rplot -F glm-parental-age -o $dir/rate-by-age.all.fathers.png,pdf,svg +xl 'Paternal age at birth (years)' +yl 'CNV rate (x100)' +cl '#f4640d' +wh 4,2.2 +dpi 150 +sty mine +beta 0.031928 +yr 0,6.5]);
+    $self->cmd(qq[cat $dir/rate-by-age.txt | awk '\$1~/mothers-all/' | cut -f2,4,5 | rplot -F glm-parental-age -o $dir/rate-by-age.all.mothers.png,pdf,svg +xl 'Maternal age at birth (years)'                       +cl '#00a077' +wh 4,2.2 +dpi 150 +sty mine +beta 0.016041 +yr 0,6.5]);
+
+    rename($dir,$outdir) or $self->throw("rename $dir $outdir: $!");
+}
+
+sub _group_quantiles
+{
+    my ($self,%args) = @_;
+    my $nquants = $args{nquantiles};
+    my $hash = $args{key2cnt};
+    my $sum = 0;
+    for my $cnt (values %$hash) { $sum += $cnt; }
+    my $qbin_size = $sum / $nquants;    # number of items per quantile bin
+    my @cbin = ();                      # current bins
+    my $nbin = 0;                       # number of items in the current bins
+    if ( $qbin_size < 1 ) { $self->throw("uh: $qbin_size .. $sum/$nbin\n"); }
+    my %out;
+    for my $key (sort {$a<=>$b} keys %$hash)
+    {
+        if ( $nbin + $$hash{$key} > $qbin_size )
+        {
+            my $id = $self->_group_median($hash,\@cbin);
+            for my $cbin (@cbin)
+            {
+                $out{bin2id}{$cbin} = $id;
+            }
+            $out{id2n}{$id} = $nbin;
+            $out{id2list}{$id} = [@cbin];
+            push @{$out{ids}},$id;
+            @cbin = ();
+            $nbin = 0;
+        }
+        push @cbin, $key;
+        $nbin += $$hash{$key};
+    }
+    if ( @cbin )
+    {
+        my $id = $self->_group_median($hash,\@cbin);
+        for my $cbin (@cbin)
+        {
+            $out{bin2id}{$cbin} = $id;
+        }
+        $out{id2n}{$id} = $nbin;
+        $out{id2list}{$id} = [@cbin];
+        push @{$out{ids}},$id;
+    }
+    return \%out;
+}
+sub _group_median
+{
+    # for an informative x-axis: find the age group's median
+    my ($self,$hash,$bins) = @_;
+    my $sum = 0;
+    for my $bin (@$bins) { $sum += $$hash{$bin}; }
+    my $msum = 0;
+    for my $bin (@$bins)
+    {
+        $msum += $$hash{$bin};
+        if ( $msum >= $sum*0.5 ) { return $bin; }
+    }
+    $self->throw("Cannot happen\n");
+}
+sub plot_origin
+{
+    my ($self,$outfile) = @_;
+    my (undef,$npat,$nmat,undef) = split(/\t/,(grep {chomp} `cat $$self{outdir}/pvals.txt | grep ^all_A`)[0]);
+    if ( !defined $npat or !defined $nmat ) { $self->throw("Not cool: cat $$self{outdir}/pvals.txt | grep ^all_A\n"); }
+    my $study =
+    [
+        { name=>'Hehir-Kwa 2011' ,  pat=>90  , mat=>28 },
+        { name=>'Wang 2016'      ,  pat=>22  , mat=>14 },
+        { name=>'Ma 2017'        ,  pat=>45  , mat=>42 },
+        { name=>'DDD'            ,  pat=>$npat, mat=>$nmat },
+    ];
+    my @lbl = ();
+
+    my $npat_tot = 0;
+    my $nmat_tot = 0;
+    for (my $i=0; $i<@$study; $i++)
+    {
+        my $dat = $$study[$i];
+        $npat_tot += $$dat{pat};
+        $nmat_tot += $$dat{mat};
+    }
+    push @$study, { name=>'Combined', pat=>$npat_tot, mat=>$nmat_tot };
+
+    if ( !($outfile=~/\.png$/) ) { $self->throw("could not parse: $outfile\n"); }
+    my $prefix = $`;
+    open(my $fh,'>',"$prefix.txt") or $self->throw("$prefix.txt: $!");
+    for (my $i=0; $i<@$study; $i++)
+    {
+        my $dat = $$study[$i];
+        ($$dat{pval},$$dat{ci0},$$dat{ci1}) = grep {chomp} $self->cmd(qq[$$self{Rscript} -e 'x<-binom.test(c($$dat{pat},$$dat{mat}),a="t"); cat(x\$p.value,x\$conf.int[1],x\$conf.int[2],sep="\\n")']);
+        my $line = join("\t",$i,$$dat{pval},$$dat{pat}/($$dat{pat}+$$dat{mat}),$$dat{ci0},$$dat{ci1})."\t$$dat{name}\t".sprintf("%.1f %d (%d, %d)",$$dat{pat}*100./($$dat{pat}+$$dat{mat}),($$dat{pat}+$$dat{mat}),$$dat{pat},$$dat{mat})."\n";
+        if ( $i+1==@$study ) { $line = '# '.$line;}
+        print $fh $line;
+        push @lbl,$$dat{name};
+    }
+    close($fh) or $self->throw("close failed: $!");
+
+    my $lbl = join(';',@lbl);
+    $self->cmd(qq[cat $prefix.txt | grep -v ^# | cut -f1,3,4,5 | mplot xy -F -o $outfile,pdf,svgz +type xyci +sty mine +yl 'Paternal CNVs' +title 'Proportion of CNVs with paternal origin' +xtl '$lbl' +xt 0,1,2,3 +xarg "rotation=20,ha='right',ma='center',fontsize=9" +xr -0.7,3.7 +yr 0,1 +line '-0.5,0.5,3.5,0.5;color=#878787;lw=1;ls=:'  +adj bottom=0.23,left=0.14,right=0.99 +dpi 150 +cl '#f4640d' +wh 5,2.5]);
+}
+
+sub run_glm_raw
+{
+    my ($self,$infile,$prefix) = @_;
+
+    open(my $fh,'>',"$prefix.r") or $self->throw("$prefix.r: $!");
+    print $fh qq[
+        library(tidyr)
+        library(dplyr)
+        library(data.table)
+        library(ggplot2)
+        library(epitools)
+
+        raw <- fread("$infile")
+        names(raw) <- c('proband','nMat-DUP','nPat-DUP','nUnkn-DUP','nMat-DEL','nPat-DEL','nUnkn-DEL','ageMat','agePat')
+        raw <- raw[!is.na(agePat) & !is.na(ageMat)]
+        raw[,ageMat:=as.numeric(ageMat)]
+        raw[,agePat:=as.numeric(agePat)]
+        raw[,sum.denovo:=`nUnkn-DEL` + `nUnkn-DUP` + `nMat-DEL`+`nMat-DUP` + `nPat-DEL`+`nPat-DUP`]
+        raw[,sum.denovo.binary:=if_else(sum.denovo>0,1,0)]
+
+        mod <- glm(`sum.denovo` ~ agePat + ageMat, data = raw, family=poisson(link="identity"))
+        # mod <- glm(`sum.denovo.binary` ~ agePat + ageMat, data = raw, family = "binomial")
+        smr <- summary(mod)
+
+        # Probability that SNV and CNV grow at the same rate: regression coefficients are normally distributed,
+        # the T statistics follows t-distribution with n-1 df
+        #
+        #   T = (\beta_{CNV} - \beta_{SNV}) / stderr(\beta_{CNV})
+        #       - follows t distribution with n-2 degrees of freedom (n=number of points used to create the fit)
+
+        beta_pat <- smr\$coefficients[2,1]
+        stde_pat <- smr\$coefficients[2,2]
+        pval_pat <- smr\$coefficients[2,4]
+        beta_mat <- smr\$coefficients[3,1]
+        stde_mat <- smr\$coefficients[3,2]
+        pval_mat <- smr\$coefficients[3,4]
+
+        beta_zero    = 0          # no effect
+        beta_mat_snv = 0.016041   # maternal de novo SNVs (divided by 50 to go from whole genome to exome, WGS rate is 0.8)
+        beta_pat_snv = 0.031928   # paternal (1.6 genome-wide)
+        
+        pval_zero_pat  <- pt(abs(beta_zero-beta_pat)/stde_pat,df=nrow(raw)-1,lower.tail=FALSE)
+        pval_zero_mat  <- pt(abs(beta_zero-beta_mat)/stde_mat,df=nrow(raw)-1,lower.tail=FALSE)
+        pval_snv_pat   <- pt(abs(beta_pat_snv-beta_pat)/stde_pat,df=nrow(raw)-1,lower.tail=FALSE)
+        pval_snv_mat   <- pt(abs(beta_mat_snv-beta_mat)/stde_mat,df=nrow(raw)-1,lower.tail=FALSE)
+
+        cat("effect size, p-value (paternal): ",beta_pat,"  ",pval_pat,"\\n")
+        cat("effect size, p-value (maternal): ",beta_mat,"  ",pval_mat,"\\n")
+        cat("P(No effect in paternal CNVs): ",beta_zero,beta_pat,";  stde: ",stde_pat,";  df: ",nrow(raw)-1,"; p-value: ",2*pval_zero_pat,"\\n")  # multiply by 2 to get a two-sided p-value
+        cat("P(No effect in maternal CNVs): ",beta_zero,beta_mat,";  stde: ",stde_mat,";  df: ",nrow(raw)-1,"; p-value: ",2*pval_zero_mat,"\\n")
+        cat("P(SNVs same as CNVs, paternal): ",beta_pat_snv,beta_pat,";  stde: ",stde_pat,";  df: ",nrow(raw)-1,"; p-value: ",2*pval_snv_pat,"\\n")
+        cat("P(SNVs same as CNVs, maternal): ",beta_mat_snv,beta_mat,";  stde: ",stde_mat,";  df: ",nrow(raw)-1,"; p-value: ",2*pval_snv_mat,"\\n")
+
+    ];
+    $self->cmd("Rscript $prefix.r > $prefix.r.out");
+}

@@ -1,0 +1,290 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+#   eval_platform:
+#       - place randomly the 280 real DECIPHER CNVs on the genome, count
+#         the number of exons affected and the number of probes deleted.
+#         From this calculate the sensitivity for 1,2,3,etc-exon CNVS
+#         under the assumption that three probes must be deleted in order
+#         to call a CNV
+#
+#
+#   ./percentage-of-small-dels-accessible.v2 -n 1e6 -c 1000gp/cnvs.txt.gz -o small-cnvs-1000gp.2M   -p 2M   > small-cnvs-1000gp.2M.txt
+#   ./percentage-of-small-dels-accessible.v2 -n 1e6 -c 1000gp/cnvs.txt.gz -o small-cnvs-1000gp.60k  -p 60k  > small-cnvs-1000gp.60k.txt
+#   ./percentage-of-small-dels-accessible.v2 -n 1e6 -c 1000gp/cnvs.txt.gz -o small-cnvs-1000gp.180k -p 180k > small-cnvs-1000gp.180k.txt
+#   ./percentage-of-small-dels-accessible.v2 -n 1e6 -c 1000gp/cnvs.txt.gz -o small-cnvs-1000gp.180k -p WES  > small-cnvs-1000gp.WES.txt
+#
+#   1000GP CNVs
+#           zless 1000gp/cnvs.txt.gz | awk '{print $3-$2+1}' | stats h -b 1e3,5e3,1e4,5e4,1e5,5e5,1e6,5e6
+#           0   1e3 66      1.00030312215823    1.00030312215823
+#           1   5e3 764     12.5795695665353    11.5792664443771
+#           2   1e4 697     23.1433767808427    10.5638072143074
+#           3   5e4 2652    63.3373749621097    40.193998181267
+#           4   1e5 1131    80.478933010003     17.1415580478933
+#           5   5e5 1213    98.8632919066384    18.3843588966353
+#           6   1e6 72      99.9545316762655    1.09123976962716
+#           7   5e6 3       100                 0.045468323734465
+#
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $opts = parse_params();
+for my $plat (keys %{$$opts{platforms}})
+{
+    $$opts{platform} = $plat;
+    $$opts{probes} = $$opts{platforms}{$plat};
+    eval_platform($opts,$$opts{probes});
+}
+
+exit;
+
+#--------------------------------
+
+sub error
+{
+    my (@msg) = @_;
+    if ( scalar @msg ) { confess @msg; }
+    print 
+        "Usage: percentage-of-small-dels-accessible [OPTIONS]\n",
+        "Options:\n",
+        "   -c, --CNVs <file>               chr,beg,end [decipher/decipher.cols.acgh-wes.txt.gz]\n",
+        "   -e, --exons <file>              chr,beg,end [regions.1545040394/Homo_sapiens.GRCh37.87.CDS-genes.1550074719.merged.txt.gz]\n",
+        "   -N, --nprobes <int>             Number of probes necessary to delete to detect a deletion [3]\n",
+        "   -n, --niter <int>               Number of random iterations, placing each call this many times [10_000]\n",
+        "   -o, --prefix <string>           Output prefix.\n",
+        "   -p, --platform <string>         Platform: acgh60k,acgh2M,wes\n",
+        "   -r, --random-seed <int>         Random seed to use, 0 for current time & 0xffff [0]\n",
+        "   -s, --sizes <list>              Run for CNVs of the listed sizes\n",
+        "   -h, -?, --help                  This help message.\n",
+        "\n";
+    exit -1;
+}
+sub parse_params
+{
+    my $opts =
+    {
+        rand_seed => 0,
+        niter  => 10_000,
+        nprobe => 3,        # minimum number of markers to call a CNV
+        platforms =>
+        {
+            '60k'    => 'acgh.60k.txt.gz',
+            '180k'   => 'acgh.180k.txt.gz',
+            '2M'     => 'acgh.2M.raw.txt.gz',
+            'WES'    => 'ddd_exome_v5_regions.merged.txt.gz',
+            wes_raw  => 'ddd_exome_v5_regions.raw.txt.gz',
+        },
+        exons => 'Homo_sapiens.GRCh37.87.CDS-genes.1550074719.merged.txt.gz',   # chr beg end gene
+        CNVs  => 'decipher/decipher.cols.acgh-wes.txt.gz',   # chr beg end
+        chr_lens =>
+        {
+            '1'   => 249250621,
+            '2'   => 243199373,
+            '3'   => 198022430,
+            '4'   => 191154276,
+            '5'   => 180915260,
+            '6'   => 171115067,
+            '7'   => 159138663,
+            '8'   => 146364022,
+            '9'   => 141213431,
+            '10'  => 135534747,
+            '11'  => 135006516,
+            '12'  => 133851895,
+            '13'  => 115169878,
+            '14'  => 107349540,
+            '15'  => 102531392,
+            '16'  => 90354753, 
+            '17'  => 81195210, 
+            '18'  => 78077248, 
+            '19'  => 59128983, 
+            '20'  => 63025520, 
+            '21'  => 48129895, 
+            '22'  => 51304566, 
+            'X'   => 155270560,
+        },
+    };
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-r' || $arg eq '--random-seed' ) { $$opts{rand_seed}=shift(@ARGV); next }
+        if ( $arg eq '-e' || $arg eq '--exons' ) { $$opts{exons}=shift(@ARGV); next }
+        if ( $arg eq '-N' || $arg eq '--nprobes' ) { $$opts{nprobe}=shift(@ARGV); next }
+        if ( $arg eq '-c' || $arg eq '--CNVs' ) { $$opts{CNVs}=shift(@ARGV); next }
+        if ( $arg eq '-s' || $arg eq '--sizes' ) { $$opts{sizes}=shift(@ARGV); next }
+        if ( $arg eq '-p' || $arg eq '--platform' ) { $$opts{platform}=shift(@ARGV); next }
+        if ( $arg eq '-n' || $arg eq '--niter' ) { $$opts{niter}=shift(@ARGV); next }
+        if ( $arg eq '-o' || $arg eq '--prefix' ) { $$opts{prefix}=shift(@ARGV); next }
+        if ( $arg eq '-?' || $arg eq '-h' || $arg eq '--help' ) { error(); }
+        error("Unknown parameter \"$arg\". Run -h for help.\n");
+    }
+    if ( exists($$opts{platform}) )
+    {
+        if ( !exists($$opts{platforms}{$$opts{platform}}) ) { error("Not supported: $$opts{platform}\n"); }
+        for my $plat (keys %{$$opts{platforms}})
+        {
+            if ( $plat ne $$opts{platform} ) { delete($$opts{platforms}{$plat}); }
+        }
+    }
+    @{$$opts{chrs}} = sort keys %{$$opts{chr_lens}};
+    $$opts{nchr} = scalar @{$$opts{chrs}};
+    init_bin2chr($opts);
+    if ( !exists($$opts{prefix}) ) { error("Missing the -o option.\n") }
+    if ( !$$opts{rand_seed} ) { $$opts{rand_seed} = 0xffff & (time()); }
+    print STDERR "Random seed $$opts{rand_seed}\n";
+    srand($$opts{rand_seed});
+    return $opts;
+}
+
+sub cmd
+{
+    my ($cmd,%args) = @_;
+
+    print STDERR $cmd,"\n";
+
+    # Why not to use backticks? Perl calls /bin/sh, which is often bash. To get the correct
+    #   status of failing pipes, it must be called with the pipefail option.
+
+    my $kid_io;
+    my $pid = open($kid_io, "-|");
+    if ( !defined $pid ) { error("Cannot fork: $!"); }
+
+    my @out;
+    if ($pid) 
+    {
+        # parent
+        @out = <$kid_io>;
+        close($kid_io);
+    } 
+    else 
+    {      
+        # child
+        exec('/bin/bash', '-o','pipefail','-c', $cmd) or error("Failed to run the command [/bin/sh -o pipefail -c $cmd]: $!");
+    }
+
+    if ( exists($args{exit_on_error}) && !$args{exit_on_error} ) { return @out; }
+
+    my $exit_status = $?;
+    my $status = exists($args{require_status}) ? $args{require_status} : 0;
+    if ( $status ne $exit_status ) 
+    {
+        my $msg;
+        if ( $? & 0xff )
+        {
+            $msg = "The command died with signal ".($? & 0xff);
+        }
+        else
+        {
+            $msg = "The command exited with status ".($? >> 8)." (expected $status)";
+        }
+        $msg .= ":\n\t$cmd\n\n";
+        if ( @out ) {  $msg .= join('',@out,"\n\n"); }
+        error($msg); 
+    }
+    return @out;
+}
+
+sub eval_platform
+{
+    my ($opts,$probes) = @_;
+
+    my @cnvs = ();
+    if ( exists($$opts{sizes}) )
+    {
+        my @sizes = split(/,/,$$opts{sizes});
+        for my $size (@sizes) { push @cnvs,$size; }
+    }
+    else
+    {
+        open(my $fh,"zless $$opts{CNVs} |") or error("zless $$opts{CNVs}: $!");
+        while (my $line=<$fh>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            chomp($line);
+            my ($chr,$beg,$end,undef) = split(/\t/,$line);
+            push @cnvs,$end-$beg+1;
+        }
+        close($fh) or error("close failed: zless $$opts{CNVs}");
+    }
+
+    cmd(qq[gunzip -c $probes | awk '{OFS="\\t"}{i++; print \$0,"m"i}' | bgzip -c > $$opts{prefix}.probes.txt.gz]);
+
+    if ( !-e "$$opts{prefix}.tmp.txt.gz" )
+    {
+        my $nprobes = $$opts{nprobe} + 1;
+        my $cmd = qq[/bin/bash -o pipefail -c "annot-regs --allow-dups --max-annots 200 -c 1,2,3 -t 4:4 -s $$opts{exons} | awk '\\\$4!=\\\".\\\"' | annot-regs --max-annots $nprobes -c 1,2,3 -t 4:5 -s $$opts{prefix}.probes.txt.gz | gzip -c > $$opts{prefix}.tmp.txt.gz.part"];
+        print STDERR "$cmd\n";
+        open(my $fh,"| $cmd") or error("$cmd: $!");
+        for (my $i=0; $i<$$opts{niter}; $i++)
+        {
+            for my $cnv (@cnvs)
+            {
+                my ($chr,$beg,$end) = rand_chr_beg_end($opts,$cnv);
+                print $fh join("\t",$chr,$beg,$end)."\n";
+            }
+        }
+        close($fh) or error("close failed: $cmd\n");
+        rename("$$opts{prefix}.tmp.txt.gz.part","$$opts{prefix}.tmp.txt.gz") or error("rename $$opts{prefix}.tmp.txt.gz.part $$opts{prefix}.tmp.txt.gz: $!");
+    }
+
+    open(my $fh,"gunzip -c $$opts{prefix}.tmp.txt.gz |") or error("gunzip -c $$opts{prefix}.tmp.txt.gz: $!");
+    my $stats = {};
+    my $line_buf = undef;
+    while (my $line=<$fh>)
+    {
+        update_stats($opts,$stats,$line);
+    }
+    close($fh) or error("close failed: gunzip -c $$opts{prefix}.tmp.txt.gz");
+
+    print "#platform\tnexon\tncalled\tnmissed\tsensitivity\n";
+    for my $nexon (sort {$a<=>$b} keys %$stats)
+    {
+        my $ncall = exists($$stats{$nexon}{called}) ? $$stats{$nexon}{called} : 0;
+        my $nmiss = exists($$stats{$nexon}{missed}) ? $$stats{$nexon}{missed} : 0;
+        printf "$$opts{platform}\t$nexon\t$ncall\t$nmiss\t%f\n",$ncall/($ncall+$nmiss);
+    }
+    if ( $$opts{debug} )
+    {
+        close($$opts{debug_fh}) or error("close failed: $$opts{debug}\n");
+        if ( -e "$$opts{debug}.part" ) { rename("$$opts{debug}.part",$$opts{debug}) or error("rename $$opts{debug}.part $$opts{debug}: $!"); }
+    }
+}
+sub update_stats
+{
+    my ($opts,$stats,$line) = @_;
+    my (@col) = split(/\t/,$line);
+    chomp($col[-1]);
+    if ( $col[3] eq '.' ) { error("this should not happen: $line\n"); return; }
+    my $nexon  = scalar split(/,/,$col[3]);
+    my $nprobe = $col[4] eq '.' ? 0 : scalar split(/,/,$col[4]);
+    if ( $nprobe >= $$opts{nprobe} ) { $$stats{$nexon}{called}++; }
+    else { $$stats{$nexon}{missed}++; }
+}
+sub rand_chr_beg_end
+{
+    my ($opts,$cnv_len) = @_;
+    my $ichr = int(rand($$opts{nbin2chr}));
+    my $chr  = $$opts{bin2chr}[$ichr];
+    my $chr_len = $$opts{chr_lens}{$chr};
+    my $beg = int(rand($chr_len - $cnv_len));
+    return ($chr,$beg,$beg+$cnv_len-1);
+}
+sub init_bin2chr
+{
+    my ($opts) = @_;
+    my $tot_len = 0;
+    for my $len (values %{$$opts{chr_lens}}) { $tot_len += $len;  }
+    
+    $$opts{nbin2chr} = 1<<16;
+    my $bin_len = $tot_len / $$opts{nbin2chr};
+
+    for my $chr (keys %{$$opts{chr_lens}})
+    {
+        my $kmax = $$opts{chr_lens}{$chr}/$tot_len*$$opts{nbin2chr};
+        for (my $k=0; $k<$kmax; $k++) { push @{$$opts{bin2chr}},$chr; }
+    }
+    $$opts{nbin2chr} = scalar @{$$opts{bin2chr}};
+}
+

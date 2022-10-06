@@ -1,0 +1,122 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use ddd_smpl;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}  = 1;
+
+    # https://www.nature.com/articles/nature15394
+    # ftp://ftp.1000genomes.ebi.ac.uk/vol1/ftp/phase3/integrated_sv_map/ALL.wgs.mergedSV.v8.20130502.svs.genotypes.vcf.gz
+    $$self{vcf_1kg}  = 'ALL.wgs.mergedSV.v8.20130502.svs.genotypes.vcf.gz';
+    $$self{baits}    = 'exome.v3v5.isec.txt';
+    $$self{bcftools} = 'bcftools';
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-prep-1000gp\n" .
+        "Options:\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    $$self{smpl} = new ddd_smpl();
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    # Create a tab-delimited file: chr,beg,end,freq
+    $self->spawn('prep_1000gp',"$$self{outdir}/cnvs.txt.gz");
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub prep_1000gp
+{
+    my ($self,$outfile) = @_;
+    my $cmd = qq[$$self{bcftools} query $$self{vcf_1kg} -i'alt~"CN" || ILEN<0' -f'%CHROM\\t%POS\\t%END\\t%ALT\\t%AF\\n' | annot-regs -s $$self{baits} -c 1,2,3 -t bait:6 --max-annots 5 | awk '\$6!="."' | cut -f1-5];
+    print STDERR "$cmd\n";
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my @alts = split(/,/,$col[3]);
+        my @afs  = split(/,/,$col[4]);
+        if ( scalar @alts != scalar @afs ) { $self->throw("Uh: $line"); }
+        my $imax = 0;
+        for (my $i=1; $i<@afs; $i++)
+        {
+            if ( $afs[$i] > $afs[$imax] ) { $imax = $i; }
+        }
+        $col[3] = $alts[$imax];
+        $col[4] = $afs[$imax];
+        print $out join("\t",@col)."\n";
+    }
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+    close($in) or $self->throw("close failed: $cmd");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+

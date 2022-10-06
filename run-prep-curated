@@ -1,0 +1,347 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use ddd_smpl;
+use TabixCache;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose} = 1;
+    $$self{curated} =
+    [
+        # 0-based column indexes
+        { type=>'DEL', is_tp=>'16', chr=>'1', beg=>'2', end=>'3', smpl=>'9', comment=>'32',         file=>'curated-dels.txt' },
+        { type=>'DUP', is_tp=>'16', chr=>'1', beg=>'2', end=>'3', smpl=>'9', comment=>'32',         file=>'curated-dups.txt' },
+        { type=>'2',   is_tp=>'21', chr=>'3', beg=>'4', end=>'5', smpl=>'1', comment=>'22',         file=>'curated-cnvs_to_review_v3_meh_v2.txt' },
+        { type=>'4',   is_tp=>'9',  chr=>'0', beg=>'1', end=>'2', smpl=>'3', comment=>'10', inh=>7, file=>'curated-xhmm.txt' },
+        { type=>'4',   is_tp=>'5',  chr=>'0', beg=>'1', end=>'2', smpl=>'3', comment=>'6',          file=>'curated-canoes.txt' },
+        { type=>'4',   is_tp=>'8',  chr=>'0', beg=>'1', end=>'2', smpl=>'3', comment=>'6',          file=>'curated-learn.txt' },
+        { type=>'4',   is_tp=>'10', chr=>'1', beg=>'2', end=>'3', smpl=>'0', comment=>'11',         file=>'curated-small-CNVs.txt' },
+    ];
+
+   $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-prep-curated\n" .
+        "Options:\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    $$self{smpl} = new ddd_smpl();
+    $$self{samples}  = 'bams-baits-smpl-sex.nodup.txt';     # bam,bait,smpl,sex  (sex is unused)
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    # Possible improvements:
+    #   - filter difficult regions, eg  DDDPXXXXXX;16;32XXXXXX;34XXXXXX
+    #   - include calls from the same region only once, eg 16;32XXXXXX;33XXXXXX
+    #     this would require one file for training and one for filling back in the cleaned calls
+
+    # Parse curated calls from all sources and unify the format
+    $self->spawn('prep_curated',"$$self{outdir}/curated.raw.txt.gz");
+    $self->wait;
+
+    # Create a high-confidence TP and FP set for training:
+    #   - remove calls with "NoTrain", "uncertain", "polymorphic" or "discrepancy" status
+    #   - remove chrX and Y to avoid possible sex-determination artefacts
+    $self->spawn('training_sets',"$$self{outdir}/curated.training.txt.gz","$$self{outdir}/curated.raw.txt.gz");
+    $self->wait;
+
+    # $self->spawn('verify_l2r',"$$self{outdir}/l2r.txt","$$self{outdir}/stringent-training-set.txt.gz");
+    # $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+sub cmp_hash_reg
+{
+    if ( $$a{chr} ne $$b{chr} ) { return $$a{chr} cmp $$b{chr}; }
+    if ( $$a{beg} < $$b{beg} ) { return -1; }
+    if ( $$a{beg} > $$b{beg} ) { return 1; }
+    if ( $$a{end} < $$b{end} ) { return -1; }
+    if ( $$a{end} > $$b{end} ) { return 1; }
+    return 0;
+}
+sub prep_curated
+{
+    my ($self,$outfile) = @_;
+    my $raw_curated = {};
+    for my $file (@{$$self{curated}})
+    {
+        my $fname = $$file{file};
+        my $itype = $$file{type};
+        my $itp   = $$file{is_tp};
+        my $ichr  = $$file{chr};
+        my $ibeg  = $$file{beg};
+        my $iend  = $$file{end};
+        my $ismpl = $$file{smpl};
+        my $icmnt = $$file{comment};
+        my $iinh  = exists($$file{inh}) ? $$file{inh} : -1;
+
+        my %calls = ();
+        open(my $fh,'<',$fname) or $self->throw("$fname: $!");
+        while (my $line=<$fh>)
+        { 
+            if ( $line=~/^#/ or $line=~/^\s*$/ ) { next; }
+            my @cols = split(/\t/,$line);
+            chomp($cols[-1]);
+            my $smpl = $$self{smpl}->smpl2smpl($cols[$ismpl]);
+            if ( !defined $smpl ) { $self->throw("Unknown sample: \"$cols[$ismpl]\"  .. $fname: $line\n"); }
+            my $chr  = $cols[$ichr]; if ( $chr eq '23' ) { $chr = 'X'; }
+            my $beg  = $cols[$ibeg];
+            my $end  = $cols[$iend];
+            my $cmnt = $cols[$icmnt]; if ( !defined $cmnt or $cmnt eq '' ) { $cmnt = '.'; }
+            my $inh  = $iinh >= 0 ? $cols[$iinh] : '';
+            my $tp   = $cols[$itp];
+            my $type = $itype=~/^\d+$/ ? uc($cols[$itype]) : uc($itype);
+
+            my $dnm = '.';
+            if ( $tp=~/DNM/ or $cmnt=~/DNM/i ) { $dnm = 1; }
+            elsif ( $tp=~/inh/i or $tp=~/biparent/ ) { $dnm = 0; }
+            elsif ( $inh=~/not_inherited/ or $cmnt=~/not_inherited/ ) { $dnm = 1; }
+            elsif ( $cmnt=~/in fath/i or $cmnt=~/in moth/ ) { $dnm = 0; }
+            elsif ( ($cmnt=~/pat/i or $cmnt=~/mat/) && $cmnt=~/inh/) { $dnm = 0; }
+
+            # Ignore overlaps: usually a big event falsely split in two and reported elsewhere
+            if ( $tp=~/overlap/i ) { next; }
+
+            my $key = "$chr-$beg-$end";
+            push @{$$raw_curated{$smpl}},{ smpl=>$smpl, chr=>$chr, beg=>$beg, end=>$end, tp=>$tp, cmnt=>$cmnt, type=>$type, inh=>$inh, file=>$fname, dnm=>$dnm };
+        }
+        close($fh) or $self->throw("close failed: $fname");
+    }
+
+    # Now curate the curated calls to remove duplicates and overlaps
+    my $curated = {};
+    for my $smpl (keys %$raw_curated)
+    {
+        my @calls = sort cmp_hash_reg @{$$raw_curated{$smpl}};
+        my $prev = undef;
+        for my $call (@calls)
+        {
+            if ( !defined $prev ) { $prev = $call; next; }
+            if ( $$prev{chr} ne $$call{chr} or $$prev{end} < $$call{beg} )
+            {
+                my $key = "$$prev{chr}-$$prev{beg}-$$prev{end}-$$prev{smpl}";
+                $$curated{$key} = $prev;
+                $prev = $call;
+                next;
+            }
+            if ( $$prev{end} < $$call{end} ) { $$prev{end} = $$call{end}; }
+        }
+        if ( defined $prev )
+        {
+            my $key = "$$prev{chr}-$$prev{beg}-$$prev{end}-$$prev{smpl}";
+            $$curated{$key} = $prev;
+        }
+    }
+
+    open(my $fh,"| bgzip -c > $outfile.part") or $self->throw("bgzip -c > $outfile.part");
+    my $i=0;
+    print $fh join("\t",'#['.++$i.']type','['.++$i.']sample','['.++$i.']chr','['.++$i.']beg','['.++$i.']end','['.++$i.']is_tp','['.++$i.']dnm','['.++$i.']inherited','['.++$i.']comment')."\n";
+    for my $key (keys %$curated)
+    {
+        my $call = $$curated{$key};
+        my @out  = ();
+        for my $prop (qw(type smpl chr beg end tp dnm inh cmnt))
+        {
+            my $val = defined($$call{$prop}) ? $$call{$prop} : '.';
+            if ( $val=~/^\s*$/ ) { $val = '.'; }
+            if ( $prop eq 'tp' && $val eq '.' ) { $self->throw("Uh: ".Dumper($call)); }
+            push @out, $val;
+        }
+        print $fh join("\t",@out)."\n";
+    }
+    close($fh) or $self->throw("close failed: bgzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub training_sets
+{
+    my ($self,$outfile,$curated_file) = @_;
+    open(my $in,"gunzip -c $curated_file |") or $self->throw("gunzip -c $curated_file: $!");
+    open(my $train_fh,"| bgzip -c > $outfile.part") or $self->throw("| bgzip -c > $outfile.part: $!");
+    open(my $stringent_fh,"| bgzip -c > $$self{outdir}/curated.stringent.txt.gz") or $self->throw("| bgzip -c > $$self{outdir}/curated.stringent.txt.gz: $!");
+    open(my $bad_fh,"| bgzip -c > $$self{outdir}/curated.bad.txt.gz") or $self->throw("| bgzip -c > $$self{outdir}/curated.bad.txt.gz: $!");
+    open(my $inh_fh,"| bgzip -c > $$self{outdir}/curated.inh.txt.gz") or $self->throw("| bgzip -c > $$self{outdir}/curated.inh.txt.gz: $!");
+    print $train_fh "#chr\tbeg\tend\ttp/fp\ttype\tsample\tDNM\n";
+    print $stringent_fh "#chr\tbeg\tend\ttp/fp\ttype\tsample\tDNM\n";
+    print $bad_fh "#chr\tbeg\tend\ttp/fp\ttype\tsample\tDNM\n";
+    print $inh_fh "#chr\tbeg\tend\ttp/fp\ttype\tsample\tDNM\n";
+    close($train_fh);
+    close($stringent_fh);
+    open($train_fh,"| sort -k1,1d -k2,2n -k3,3n | bgzip -c >> $outfile.part") or $self->throw("| bgzip -c > $outfile.part: $!");
+    open($stringent_fh,"| sort -k1,1d -k2,2n -k3,3n | bgzip -c >> $$self{outdir}/curated.stringent.txt.gz") or $self->throw("| bgzip -c > $$self{outdir}/curated.stringent.txt.gz: $!");
+    my ($cols,$ichr,$itp,$ismpl,$ibeg,$iend,$itype,$idnm) = $self->col_names($curated_file,'chr','is_tp','sample','beg','end','type','dnm');
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $stringent = 1;
+        my $training  = 1;
+        my $uncertain = 0;
+        my $type = undef;
+        my $inherited = 0;
+        if ( $col[$ichr] eq 'X' or $col[$ichr] eq 'Y' ) { $training = 0; }
+        if ( $col[$itp] =~ /Inh/ ) { $inherited = 1; }
+        if ( $col[$itp] =~ /Polymorphic/i ) { $training = 0; $stringent = 0; }
+        if ( $col[$itp] =~ /NoTrain/i ) { $training = 0; }
+        if ( $col[$itp] =~ /discrepancy/i ) { $training = 0; }
+        if ( $col[$itp] =~ /uncertain/i ) { $training = 0; $stringent = 0; $uncertain = 1; }
+        if ( $col[$itp] =~ /TP/ ) { $type = 'TP'; }
+        elsif ( $col[$itp] =~ /FP/ ) { $type = 'FP'; }
+        else { $self->throw("Unknown type (TP or FP?): $line .. $curated_file\n"); }
+        
+        my $line = join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,uc($col[$itype]),$col[$ismpl],$col[$idnm])."\n";
+        if ( !$uncertain )
+        {
+            if ( $stringent ) { print $stringent_fh $line; }
+            if ( $training ) { print $train_fh $line; }
+        }
+        if ( $type eq 'FP'  ) { print $bad_fh $line; }
+        if ( $inherited ) { print $inh_fh $line; }
+    }
+    close($in) or $self->throw("close failed: gunzip -c $curated_file");
+    close($stringent_fh) or $self->throw("close failed: bgzip -c > $$self{outdir}/curated.stringent.txt.gz");
+    close($bad_fh) or $self->throw("close failed: bgzip -c > $$self{outdir}/curated.bad.txt.gz");
+    close($inh_fh) or $self->throw("close failed: bgzip -c > $$self{outdir}/curated.inh.txt.gz");
+    close($train_fh) or $self->throw("close failed: bgzip -c > $outfile.part");
+    $self->cmd("tabix -s1 -b2 -e3 $$self{outdir}/curated.stringent.txt.gz");
+    $self->cmd("tabix -s1 -b2 -e3 $outfile.part");
+    rename("$outfile.part.tbi","$outfile.tbi") or $self->throw("rename $outfile.part.tbi $outfile.tbi: $!");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub calc_mean
+{
+    my ($vals) = @_;
+    if ( !@$vals ) { return 0; }
+    my $mean = 0;
+    for my $val (@$vals) { $mean += $val; }
+    $mean /= @$vals;
+    return $mean;
+}
+sub verify_l2r
+{
+    my ($self,$outfile,$infile) = @_;
+
+    open(my $fh,'<',$$self{samples}) or $self->throw("$$self{samples}: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my %rec;
+        @rec{qw(bam baits smpl sex)} = split(/\t/,$line);
+        if ( exists($$self{smpl2info}{$rec{smpl}}) ) { $self->warn("The sample \"$rec{smpl}\" is present twice in $$self{samples}\n"); next; }
+        $$self{smpl2info}{$rec{smpl}} = \%rec;
+    }
+    close($fh) or $self->throw("close failed: $$self{samples}");
+
+    $$self{tabix_l2r} = TabixCache->new(norm=>1,col=>3);
+    my ($cols,$ichr,$itp,$ismpl,$ibeg,$iend,$itype) = $self->col_names($infile,'chr','tp/fp','sample','beg','end','type');
+    my $csmpl = $ismpl+1;
+    open(my $in,"gunzip -c $infile | sort -k$csmpl,$csmpl |") or $self->throw("gunzip -c $infile | sort -k$csmpl,$csmpl: $!");
+    open(my $out,"| sort -k1,1d -k2,2g > $outfile.part") or $self->throw("sort -k1,1d -k2,2g > $outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        chomp($line);
+        my @col  = split(/\t/,$line);
+        my $chr  = $col[$ichr];
+        my $beg  = $col[$ibeg];
+        my $end  = $col[$iend];
+        my $smpl = $col[$ismpl];
+        my $l2r_file = $$self{smpl2info}{$smpl}{bam}.'.l2r.txt.gz';
+        my $vals = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$end);
+        my $mean = calc_mean($vals);
+        printf $out "$col[$itp]\t%f\t$line\n", $mean;
+    }
+    close($in) or $self->throw("close failed: gunzip -c $infile | sort -k$csmpl,$csmpl");
+    close($out) or $self->throw("close failed: sort -k1,1d -k2,2g > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+

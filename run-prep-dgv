@@ -1,0 +1,187 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}  = 1;
+
+    # link from http://dgv.tcag.ca/dgv/app/downloads
+    $$self{url}  = 'http://dgv.tcag.ca/dgv/docs/DGV.GS.March2016.50percent.GainLossSep.Final.hg19.gff3';    # the gold standard variants
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-prep-dgv\n" .
+        "Options:\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    if ( $$self{url} =~ /\.gff3$/  )
+    {
+        $self->spawn('run_cmd',"$$self{outdir}/raw.gff.gz",qq[wget -O $$self{outdir}/raw.gff.part $$self{url} && gzip $$self{outdir}/raw.gff.part && mv $$self{outdir}/raw.gff.part.gz $$self{outdir}/raw.gff.gz]);
+        $self->wait;
+
+        # Create a tab-delimited file: chr,beg,end,freq
+        $self->spawn('prep_dgv_gff',"$$self{outdir}/cnvs.txt.gz");
+        $self->wait;
+    }
+    else
+    {
+        $self->spawn('run_cmd',"$$self{outdir}/raw.txt.gz",qq[wget -O $$self{outdir}/raw.txt.part $$self{url} && gzip $$self{outdir}/raw.txt.part && mv $$self{outdir}/raw.txt.part.gz $$self{outdir}/raw.txt.gz]);
+        $self->wait;
+
+        # Create a tab-delimited file: chr,beg,end,freq
+        $self->spawn('prep_dgv',"$$self{outdir}/cnvs.txt.gz");
+        $self->wait;
+    }
+
+    $self->all_done;
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+
+sub prep_dgv
+{
+    my ($self,$outfile) = @_;
+
+    my $raw = "$$self{outdir}/raw.txt.gz";
+    my ($cols,$ichr,$ibeg,$iend,$itype,$igain,$iloss) = $self->col_names($raw,qw(chr start end varianttype observedgains observedlosses));
+    open(my $in,"gunzip -c $raw |") or $self->throw("gunzip -c $raw: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $out '#'.join("\t",qw(chr beg end nobs))."\n";
+    <$in>;  # eat the header
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[$itype] ne 'CNV' ) { next; }
+        my $nobs = $col[$igain] ? $col[$igain] : 0;
+        $nobs += $col[$iloss] ? $col[$iloss] : 0;
+        print $out join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$nobs)."\n";
+    }
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+    close($in) or $self->throw("close failed: gunzip -c $raw");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub prep_dgv_gff
+{
+    my ($self,$outfile) = @_;
+
+    my $raw = "$$self{outdir}/raw.gff.gz";
+    open(my $in,"gunzip -c $raw |") or $self->throw("gunzip -c $raw: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $out '#'.join("\t",qw(chr beg end nobs))."\n";
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[1] ne 'CNV' ) { next; }
+        my $chr = $col[0];
+        $chr =~ s/^chr//;
+        my %ann = ();
+        for my $key_val (split(/;/,$col[8]))
+        {
+            my ($key,$val) = split(/=/,$key_val);
+            $ann{$key} = $val;
+        }
+        my $beg  = $ann{inner_start};
+        my $end  = $ann{inner_end};
+        my $nobs = $ann{num_samples};
+        print $out join("\t",$chr,$beg,$end,$nobs)."\n";
+    }
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+    close($in) or $self->throw("close failed: gunzip -c $raw");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+

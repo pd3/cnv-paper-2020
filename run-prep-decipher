@@ -1,0 +1,204 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use ddd_smpl;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose} = 1;
+    $$self{decipher}       = 'decipher_dump.130219.1550059941.txt';
+    $$self{curated}        = 'curated.paper/curated.raw.txt.gz';      # to exclude aCGH-vs-WES discrepancy, apparent FPs, and to mark inherited calls
+    $$self{acgh_wes_smpls} = 'samples/wes-acgh.probands.txt';
+    $$self{rename_samples} = 'rename-ddd-samples';
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-prep-decipher\n" .
+        "Options:\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    $$self{smpl} = new ddd_smpl();
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    # Parse DECIPHER call and unify the format. Include only validated CNVs and
+    # create several files, with all and pathogenic+likely pathogenic CNVs. (Excludes X,Y.)
+    $self->spawn('prep_decipher',"$$self{outdir}/decipher.txt.gz");
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+sub prep_decipher
+{
+    my ($self,$outfile) = @_;
+    my %isec = map { $_=>1 } grep { chomp } $self->cmd("cat $$self{acgh_wes_smpls}");
+    my ($cols,$ismpl,$ichr,$ibeg,$iend,$ipathogenic,$ivalid,$imean,$ifeedback,$idnm) = $self->col_names($$self{decipher},qw(patient_id chr start end pathogenicity validation mean_ratio feedback inheritance));
+    open(my $out_all,"| bgzip -c > $outfile.part") or $self->throw("bgzip -c > $outfile.part: $!");
+    open(my $out_path,"| bgzip -c > $$self{outdir}/decipher.pathogenic.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.pathogenic.txt.gz: $!");
+    open(my $out_smpl,'>',"$$self{outdir}/samples.txt") or $self->throw("$$self{outdir}/samples.txt: $!");
+    open(my $out_dup,"| bgzip -c > $$self{outdir}/decipher.dup.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.dup.txt.gz: $!");
+    open(my $out_del,"| bgzip -c > $$self{outdir}/decipher.del.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.del.txt.gz: $!");
+    open(my $out_cols,"| bgzip -c > $$self{outdir}/decipher.cols.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.cols.txt.gz: $!");
+    open(my $out_isec,"| bgzip -c > $$self{outdir}/decipher.cols.acgh-wes.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.cols.acgh-wes.txt.gz: $!");
+    open(my $out_raw,"| bgzip -c > $$self{outdir}/decipher.raw.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.raw.txt.gz: $!");
+    open(my $out_dnm,"| bgzip -c > $$self{outdir}/decipher.dnm.txt.gz") or $self->throw("bgzip -c > $$self{outdir}/decipher.dnm.txt.gz: $!");
+
+    # Rename samples to person_stable_id
+    $self->cmd(qq[zless $$self{decipher} | $$self{rename_samples} -c 2 -t person_stable_id | gzip -c > $$self{outdir}/raw.txt.gz]);
+    my $cmd = qq[annot-regs -s $$self{curated} -d $$self{outdir}/raw.txt.gz -c chr,beg,end:chr,start,end -m sample:patient_id -t dnm,is_tp];
+    print STDERR "$cmd\n";
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+
+    print $out_dup  "#".join("\t",qw(chr beg end smpl))."\n";
+    print $out_del  "#".join("\t",qw(chr beg end smpl))."\n";
+    print $out_all  "#".join("\t",qw(chr beg end type_chr_beg_end_smpl))."\n";
+    print $out_path "#".join("\t",qw(chr beg end type smpl))."\n";
+    print $out_cols "#".join("\t",qw(chr beg end type smpl type_chr_beg_end_smpl))."\n";
+    print $out_dnm  "#".join("\t",qw(chr beg end type smpl type_chr_beg_end_smpl))."\n";
+    print $out_isec "#".join("\t",qw(chr beg end type smpl type_chr_beg_end_smpl))."\n";
+    print $out_raw  "#".join("\t",qw(chr beg end type smpl validated pathogenic feedback))."\n";
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $smpl = $col[$ismpl];
+        my $type = $col[$imean] < 0 ? 'DEL' : 'DUP';
+        my $validated  = $col[$ivalid]=~/^\s*$/ ? '.' : lc($col[$ivalid]);
+        my $pathogenic = $col[$ipathogenic]=~/^\s*$/ ? '.' : lc($col[$ipathogenic]);
+        my $feedback   = $col[$ifeedback]=~/^\s*$/ ? '.' : lc($col[$ifeedback]);
+        $validated  =~ s/\s+/_/g;
+        $pathogenic =~ s/\s+/_/g;
+        $feedback   =~ s/\s+/_/g;
+        if ( $validated eq 'not_applicable' ) { $validated = '.'; }
+        if ( $pathogenic eq 'not_applicable' ) { $pathogenic = '.'; }
+        if ( $feedback eq 'not_applicable' ) { $feedback = '.'; }
+        my $is_tp   = $col[-1];
+        my $is_dnm  = $col[-2] eq '0' ? '0' : '1';
+        if ( !$is_dnm )
+        {
+            if ( $col[$idnm]=~/de novo/i ) { print STDERR "DNM conflict: \"$col[$idnm]\" vs \"$col[-2]\" ($is_dnm) .. $line\n"; }
+        }
+        else
+        {
+            if ( $col[$idnm]=~/inherited/i || $col[$idnm]=~/biparental/i ) { $is_dnm = 0; }
+        }
+
+        if ( $is_tp=~/FP/ or $is_tp=~/Discrepancy/ ) { print STDERR "Skipping: ".join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,$smpl)."\t$col[-1]\n"; next; }
+
+        print $out_raw join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,$smpl,$validated,$pathogenic,$feedback)."\n";
+
+        if ( $col[$ichr] eq 'X' or $col[$ichr] eq 'Y' ) { next; }
+        if ( !($col[$ivalid] =~ /Validated/i) ) { next; }
+        my $key  = "$type-$col[$ichr]-$col[$ibeg]-$col[$iend]-$smpl";           # DEL-chr-beg-end-DDDPXXXXX
+        my $line = join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$key)."\n";    # chr beg end DEL-chr-beg-end-DDDPXXXXX
+        print $out_all $line;
+        if ( $col[$ipathogenic] =~ /pathogenic/i ) { print $out_path join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,$smpl)."\n"; }
+        print $out_smpl "$smpl\n";
+        my $out = $type eq 'DEL' ? $out_del : $out_dup;
+        print $out join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$smpl)."\n";
+        print $out_cols join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,$smpl,$key)."\n";
+        if ( $isec{$smpl} ) { print $out_isec join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,$smpl,$key)."\n"; }
+        if ( $isec{$smpl} && $is_dnm eq '1' ) { print $out_dnm join("\t",$col[$ichr],$col[$ibeg],$col[$iend],$type,$smpl,$key)."\n"; }
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out_smpl) or $self->throw("close failed: $$self{outdir}/samples.txt");
+    close($out_path) or $self->throw("close failed: $$self{outdir}/decipher.pathogenic.txt.gz");
+    close($out_dup) or $self->throw("close failed: $$self{outdir}/decipher.dup.txt.gz");
+    close($out_del) or $self->throw("close failed: $$self{outdir}/decipher.del.txt.gz");
+    close($out_all) or $self->throw("close failed: bgzip -c > $outfile.part");
+    close($out_cols) or $self->throw("close failed: bgzip -c > $$self{outdir}/decipher.cols.txt.gz");
+    close($out_dnm) or $self->throw("close failed: bgzip -c > $$self{outdir}/decipher.dnm.txt.gz");
+    close($out_isec) or $self->throw("close failed: bgzip -c > $$self{outdir}/decipher.cols.acgh-wes.txt.gz");
+    close($out_raw) or $self->throw("close failed: bgzip -c > $$self{outdir}/decipher.raw.txt.gz");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+

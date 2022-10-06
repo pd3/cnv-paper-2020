@@ -1,0 +1,216 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}  = 1;
+    $$self{bbatch}   = '1e8';
+    $$self{nbatch}   =     1_000_000_000;
+    $$self{nperm}    = 1_000_000_000_000;
+    $$self{test_exe} = 'perm-test';     # from https://github.com/pd3/utils
+    $$self{ref_fai}  = 'autosomes.fa.fai';
+
+    $$self{_sampleconf} = q[
+
+        # number of permutations total
+        nperm  => ]. $$self{nperm}  .q[,
+
+        # number of iterations per job
+        nbatch => ]. $$self{nbatch} .q[,
+
+        # number of iterations per batch (within one job), reduces memory usage
+        bbatch => ]. $$self{bbatch} .q[,
+
+        test_exe => '] . $$self{test_exe} .q[',
+        ref_fai  => '] . $$self{ref_fai} .q[',
+
+        background_regs => undef,
+        target_regs     => undef,
+        calls           => undef,
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: Permutation test - frontend to perm-test\n" .
+        "Usage: run-permutation-test\n" .
+        "Options:\n" .
+        "   -c, --calls <file>              Calls to permute: chr,beg,end\n" .
+        "   -b, --background-regs <file>    Regions expected not to be enriched: chr,beg,end\n" .
+        "   -f, --ref-fai <file>            Chromosome lengths, given for example as a fai index: chr,length\n" .
+        "   -t, --target-regs <file>        Target regions expected to be enriched: chr,beg,end\n" .
+        "   -n, --niter <total,batch>       Number of iterations total and per batch [$$self{nperm},$$self{nbatch}]\n" .
+        "   -o, --outdir <dir>              Output directory\n" .
+        "   -p, --plot-args <args>          Arguments to pass to `mplot barplot`\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-p' or $arg eq '--plot-args' ) { $$self{plot_args}=shift(@ARGV); next; }
+        if ( $arg eq '-b' or $arg eq '--background-regs' ) { $$self{background_regs}=shift(@ARGV); next; }
+        if ( $arg eq '-t' or $arg eq '--target-regs' ) { $$self{target_regs}=shift(@ARGV); next; }
+        if ( $arg eq '-f' or $arg eq '--ref-fai' ) { $$self{ref_fai}=shift(@ARGV); next; }
+        if ( $arg eq '-c' or $arg eq '--calls' ) { $$self{calls}=shift(@ARGV); next; }
+        if ( $arg eq '-n' or $arg eq '--niter' )
+        {
+            ($$self{nperm},$$self{nbatch}) = split(',',shift(@ARGV));
+            next; 
+        }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !defined($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( !defined($$self{calls}) ) { $self->throw("Expected the -c option."); }
+    if ( !defined($$self{background_regs}) ) { $self->throw("Expected the -b option."); }
+    if ( !defined($$self{target_regs}) ) { $self->throw("Expected the -t option."); }
+    if ( !defined($$self{ref_fai}) ) { $self->throw("Expected the -f option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    if ( !$self->is_finished("$$self{outdir}/pvalue.txt") )
+    {
+        #$self->set_limits(memory=>10_000);
+
+        my @files = ();
+        my $njob  = 1 + int($$self{nperm}/$$self{nbatch});
+        for (my $i=0; $i<$njob; $i++)
+        {
+            push @files, "$$self{outdir}/perm/$i";
+            $self->spawn('perm_test',"$$self{outdir}/perm/$i",$i);
+        }
+        $self->wait;
+
+        $self->spawn('eval_perm',"$$self{outdir}/pvalue.txt",\@files);
+        $self->wait;
+    }
+
+    $self->spawn('plot_barplot',"$$self{outdir}/dist.png","$$self{outdir}/dist.txt");
+    $self->wait;
+
+    print "$$self{outdir}/pvalue.txt\n";
+    print `cat $$self{outdir}/pvalue.txt`;
+
+    $self->all_done;
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+sub perm_test
+{
+    my ($self,$outfile,$rseed) = @_;
+    $self->cmd("$$self{test_exe} -c $$self{calls} -b $$self{background_regs} -t $$self{target_regs} -f $$self{ref_fai} -s $rseed -n $$self{nbatch},$$self{bbatch} -o $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub eval_perm
+{
+    my ($self,$outfile,$files) = @_;
+    my ($nexc,$nfew,$ntot,$nhit_obs,$nhit_avg,$nhit_dev);
+    my $dist = {};
+    for my $file (@$files)
+    {
+        my @lines = $self->cmd("cat $file | grep ^TEST_ENR",verbose=>0);
+        if ( @lines != 1 ) { $self->throw("Unexpected: $file"); }
+        my @cols = split(/\t/,$lines[0]);
+        chomp($cols[-1]);
+        $ntot += $cols[1];  
+        $nexc += $cols[2];
+
+        @lines = $self->cmd("cat $file | grep ^TEST_DPL",verbose=>0);
+        if ( @lines != 1 ) { $self->throw("Unexpected: $file"); }
+        @cols = split(/\t/,$lines[0]);
+        chomp($cols[-1]);
+        $nfew += $cols[2];
+
+        @lines = $self->cmd("cat $file | grep ^TEST_FOLD",verbose=>0);
+        if ( @lines != 1 ) { $self->throw("Unexpected: $file"); }
+        @cols = split(/\t/,$lines[0]);
+        chomp($cols[-1]);
+        if ( !defined $nhit_obs ) { $nhit_obs = $cols[1]; }
+        if ( $nhit_obs ne $cols[1] ) { $self->throw("Unexpected: $file .. $nhit_obs vs $cols[1]\n"); }
+        $nhit_avg += $cols[2];
+        $nhit_dev += $cols[3];
+
+        open(my $fh,'<',$file) or $self->throw("$file: $!");
+        while (my $line=<$fh>)
+        {
+            if ( $line=~/^DIST\t(\d+)\t(\d+)\t(\d+)/ )
+            {
+                if ( $1 + 1 != $2 ) { $self->throw("Yes, it can happen: $file\n"); }
+                $$dist{$1} += $3;
+            }
+        }
+        close($fh) or $self->throw("close failed: $file");
+    }
+
+    open(my $fh,'>',"$$self{outdir}/dist.txt") or $self->throw("$$self{outdir}/dist.txt: $!");
+    for my $key (sort {$a<=>$b} keys %$dist)
+    {
+        print $fh "$key\t$$dist{$key}\n";
+    }
+    close($fh) or $self->throw("close failed: $$self{outdir}/dist.txt");
+
+    $nhit_avg /= scalar @$files;
+    $nhit_dev /= scalar @$files;
+    open($fh,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    my $pval_enr = $nexc ? sprintf("=%e", $nexc/$ntot) : sprintf("<%e", 1/$ntot);
+    my $pval_dpl = $nfew ? sprintf("=%e", $nfew/$ntot) : sprintf("<%e", 1/$ntot);
+    my $fold = $nhit_avg ? sprintf("%.4f",1.0*$nhit_obs/$nhit_avg) : 'inf';
+    print $fh "niter=$ntot\tnexceed=$nexc\tpval$pval_enr\n";
+    print $fh "niter=$ntot\tnfewer=$nfew\tpval$pval_dpl\n";
+    printf $fh "nhit_obs=$nhit_obs\tnhit_avg=%f\tnhit_dev=%f\tfold_increase=$fold\n", $nhit_avg,$nhit_dev;
+    close($fh) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub plot_barplot
+{
+    my ($self,$outfile,$dist) = @_;
+    chomp(my $max_dist = ($self->cmd(qq[cat $dist | awk '{if(m<\$2)m=\$2}END{print m}']))[0]);
+    chomp(my $nhit_obs = ($self->cmd(qq[cat $$self{outdir}/pvalue.txt | grep ^nhit_obs | sed 's,^.*nhit_obs=\\d*,, ; s,\\s.*\$,,']))[0]);
+    my $plot_args = exists($$self{plot_args}) ? $$self{plot_args} : '';
+    $self->cmd(qq[cat $dist | mplot barplot -F -o $outfile +type x-cnt +sty mine +line '$nhit_obs,0,$nhit_obs,$max_dist;color=#242424;lw=2;ls=:' $plot_args]);
+}
+
+
+

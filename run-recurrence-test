@@ -1,0 +1,286 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose}   = 1;
+    $$self{nbatch}    =     1_000_000;
+    $$self{nperm}     = 1_000_000_000;
+    $$self{test_exe}  = 'recurrence-test';   # from https://github.com/pd3/utils
+    $$self{ref_fai}   = 'hs37d5.fa.fai';
+    #$$self{dd_genes} = 'DDG2P_1_11_2019.mono.genes.CDS.merged.txt.gz';
+    $$self{FDR_th}    = 0.001;
+
+    $$self{_sampleconf} = q[
+
+        # number of permutations total
+        nperm  => ]. $$self{nperm}  .q[,
+
+        # number of iterations per job
+        nbatch => ]. $$self{nbatch} .q[,
+
+        # where to draw the line (literally, in the graph)
+        FDR_th => ]. $$self{FDR_th} .q[,
+
+        test_exe => '] . $$self{test_exe} .q[',
+        ref_fai  => '] . $$self{ref_fai} .q[',
+
+        accessible_regs => undef,
+        labeled_regs    => undef,
+        calls           => undef,
+
+        # limits   => { runtime=>2*60 },
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: Recurrence test - frontend to recurrence-test\n" .
+        "Usage: run-recurrence-test\n" .
+        "Options:\n" .
+        "   -c, --calls <file>                          Calls to permute: chr,beg,end\n" .
+        "       --color-genes <color:genes,..>          Use different color for these genes, given either as list or (todo) a file name\n" .
+        "   -a, --accessible-regs <file>                All accessible regions: chr,beg,end\n" .
+        "   -f, --ref-fai <file>                        Chromosome lengths, given for example as a fai index: chr,length\n" .
+        "   -l, --labeled-regs <file>                   Labeled regions: chr,beg,end,label\n" .
+        "   -n, --niter <total,batch>                   Number of iterations total and per batch [$$self{nperm},$$self{nbatch}]\n" .
+        "   -o, --outdir <dir>                          Output directory\n" .
+        "   -p, --plot-args <args>                      Arguments to pass to `mplot barplot`\n" .
+        "   -t, --FDR-th <float>                        FDR threshold for plotting\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '--color-genes' )
+        {
+            my $tmp = shift(@ARGV);
+            my ($color,$genes) = split(/:/,$tmp);
+            for my $gene (split(/,/,$genes)) { $$self{color_genes}{$gene} = $color; }
+            next;
+        }
+        if ( $arg eq '-p' or $arg eq '--plot-args' ) { $$self{plot_args}=shift(@ARGV); next; }
+        if ( $arg eq '-a' or $arg eq '--accessible-regs' ) { $$self{accessible_regs}=shift(@ARGV); next; }
+        if ( $arg eq '-l' or $arg eq '--labeled-regs' ) { $$self{labeled_regs}=shift(@ARGV); next; }
+        if ( $arg eq '-f' or $arg eq '--ref-fai' ) { $$self{ref_fai}=shift(@ARGV); next; }
+        if ( $arg eq '-c' or $arg eq '--calls' ) { $$self{calls}=shift(@ARGV); next; }
+        if ( $arg eq '-t' or $arg eq '--FDR-th' ) { $$self{FDR_th}=shift(@ARGV); next; }
+        if ( $arg eq '-n' or $arg eq '--niter' )
+        {
+            ($$self{nperm},$$self{nbatch}) = split(',',shift(@ARGV));
+            next; 
+        }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !defined($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( !defined($$self{calls}) ) { $self->throw("Expected the -c option."); }
+    if ( !defined($$self{labeled_regs}) ) { $self->throw("Expected the -l option."); }
+    if ( !defined($$self{ref_fai}) ) { $self->throw("Expected the -f option."); }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    if ( !$self->is_finished("$$self{outdir}/merged.txt") )
+    {
+        $self->set_limits(%{$$self{limits}}) unless !exists($$self{limits});
+        my @files = ();
+        my $njob  = 1 + int($$self{nperm}/$$self{nbatch});
+        for (my $i=0; $i<$njob; $i++)
+        {
+            push @files, "$$self{outdir}/perm/$i";
+            $self->spawn('perm_test',"$$self{outdir}/perm/$i",$i);
+        }
+        $self->wait;
+        $self->set_limits(runtime=>undef,memory=>undef) unless !exists($$self{limits});
+
+        $self->spawn('eval_perm',"$$self{outdir}/merged.txt",\@files);
+        $self->wait;
+    }
+
+    $self->spawn('plot_manhattan',"$$self{outdir}/manhattan.png","$$self{outdir}/merged.txt");
+    $self->wait;
+
+    # print "$$self{outdir}/pvalue.txt\n";
+    # print `cat $$self{outdir}/pvalue.txt`;
+
+    $self->all_done;
+}
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+sub perm_test
+{
+    my ($self,$outfile,$rseed) = @_;
+    my $regs = exists($$self{accessible_regs}) && defined($$self{accessible_regs}) ? "-a $$self{accessible_regs}" : '';
+    $self->cmd("$$self{test_exe} -c $$self{calls} $regs -l $$self{labeled_regs} -f $$self{ref_fai} -s $rseed -n $$self{nbatch} -o $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub eval_perm
+{
+    my ($self,$outfile,$files) = @_;
+    my $test = {};
+    my $dist = {};
+    for my $file (@$files)
+    {
+        open(my $fh,'<',$file) or $self->throw("$file: $!");
+        while (my $line=<$fh>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            chomp($line);
+            my @col = split("\t",$line);
+            if ( $col[0] eq 'TEST' )
+            {
+                my $gene = $col[1];
+                my $nobs = $col[2];
+                my @vals = @col[3..$#col];
+                $$test{$gene}[0] = $nobs;
+                for (my $i=0; $i<@vals; $i++)
+                {
+                    $$test{$gene}[$i+1] += $vals[$i];
+                }
+            }
+            elsif ( $col[0] eq 'DIST' )
+            {
+                my $gene = $col[1];
+                my @vals = @col[2..$#col];
+                for (my $i=0; $i<@vals; $i++)
+                {
+                    $$dist{$gene}[$i] += $vals[$i];
+                }
+            }
+        }
+        close($fh) or $self->throw("close failed: $file");
+    }
+
+    open(my $fh,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    for my $key (sort keys %$test)
+    {
+        print $fh join("\t",'TEST',$key,@{$$test{$key}})."\n";
+    }
+    for my $key (sort keys %$dist)
+    {
+        print $fh join("\t",'DIST',$key,@{$$dist{$key}})."\n";
+    }
+    close($fh) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub plot_manhattan
+{
+    my ($self,$outfile,$infile) = @_;
+
+    if ( !($outfile=~/\.png$/) ) { $self->throw("Expected .png suffix for $outfile!\n"); }
+
+    my $gene2nobs = {};
+    my $gene2pval = {};
+    my $gene2reg  = {};
+    my $gene2non0 = {};
+
+    #my $is_dd = { map {$_=>1} grep {chomp} $self->cmd("gunzip -c $$self{dd_genes} | cut -f4") };
+
+    open(my $fh,'<',$infile) or $self->throw("$infile: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my @col = split(/\t/,$line);
+        if ( $col[0] eq 'TEST' )
+        {
+            my $pval = (1+$col[4]+$col[5])/(1+$col[3]+$col[4]+$col[5]);
+            my $gene = $col[1];
+            $$gene2pval{$gene} = $pval;
+            $$gene2nobs{$gene} = $col[2];
+            if ( $col[2] ) { $$gene2non0{$gene} = $col[2]; }
+        }
+    }
+    close($fh) or $self->throw("close failed: $infile");
+
+    my $cmd = "zless $$self{labeled_regs}";
+    open($fh,"$cmd |") or $self->throw("$cmd: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my ($chr,$beg,$end,$gene) = split(/\t/,$line);
+        if ( !exists($$gene2pval{$gene}) or exists($$gene2reg{$gene}) ) { next; }
+        $$gene2reg{$gene} = [$chr,$beg];
+    }
+    close($fh) or $self->throw("close failed: $cmd");
+
+    if ( !($outfile=~/\.[^\.]+$/) ) { $self->throw("Could not parse: $outfile\n"); }
+    my $prefix = $`;
+    open($fh,'>',"$prefix.txt") or $self->throw("$prefix.txt: $!");
+    print $fh '#'.join("\t", qw(chr pos pvalue gene nobserved))."\n";
+    for my $gene (sort {
+                        if ( $$gene2reg{$a}[0] eq $$gene2reg{$b}[0] ) { return $$gene2reg{$a}[1]<=>$$gene2reg{$b}[1]; }
+                        if ( $$gene2reg{$a}[0]=~/^\d+$/ &&  $$gene2reg{$b}[0]=~/^\d+$/ ) { return $$gene2reg{$a}[0]<=>$$gene2reg{$b}[0]; }
+                        if ( $$gene2reg{$a}[0]=~/^\d+$/ ) { return -1; }
+                        if ( $$gene2reg{$b}[0]=~/^\d+$/ ) { return 1; }
+                        return $$gene2reg{$a}[0] cmp $$gene2reg{$b}[0];
+                    } keys %$gene2reg)
+    {
+        my $color = '.';
+        #if ( exists($$is_dd{$gene}) && $$gene2pval{$gene}<1 ) { $color = '#f4640d'; }
+        if ( exists($$self{color_genes}) && exists($$self{color_genes}{$gene}) ) { $color = $$self{color_genes}{$gene}; }
+        print $fh join("\t",$$gene2reg{$gene}[0],$$gene2reg{$gene}[1],$$gene2pval{$gene},$color,$gene,$$gene2nobs{$gene})."\n";
+    }
+    close($fh) or $self->throw("close failed: $prefix.txt");
+
+    # Draw a line and highlight hits above a XX Benjamini-Hochberg threshold
+    my @pvals = sort {$a<=>$b} values %$gene2pval;
+    my $ntests = scalar @pvals;
+    my $pval_th;
+    for (my $i=$#pvals; $i>=0; $i--)
+    {
+        if ( $pvals[$i] <= $$self{FDR_th}*($i+1)/$ntests ) { $pval_th = $pvals[$i]; last; }
+    }
+    if ( !defined $pval_th ) { $pval_th = $$self{FDR_th}/$ntests; }
+    # my $pval_th  = 0.05 / scalar keys %$gene2non0;  # Bonferroni
+
+    `echo "FDR_th=$$self{FDR_th}\tpval_th=$pval_th\tntests=$ntests" > $prefix.pval-th.txt`;
+
+    my $plt_args = exists($$self{plot_args}) ? $$self{plot_args} : '';
+
+    $self->cmd(qq[cat $prefix.txt | grep -v ^# | mplot manhattan -F -o $prefix.part.png +type chr-x-y-col +ys -log10 +wh 5,2 +adj bottom=0.12,left=0.1,right=0.99 +sty mine +yl '\$-\\log_{10}(P)\$':4 +dpi 150 +cl grey +th '$pval_th,linestyle="--",lw=1' $plt_args]);
+    rename("$prefix.part.png",$outfile) or $self->throw("rename $prefix.part.png $outfile: $!");
+}
+
+

@@ -1,0 +1,2178 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#   
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+use Data::Dumper;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose} = 1;
+    $$self{dist}   = 'dist';        # dist from https://github.com/pd3/utils
+    $$self{exons}  = 'Homo_sapiens.GRCh37.87.CDS-genes.1550074719.merged.txt.gz';
+    $$self{truth}  =
+    {
+         decipher => 'decipher/decipher.cols.acgh-wes.txt.gz',           # 280 calls, not all have WES parent data
+    };
+    $$self{acgh2M} = ['cnsolidate/random-forest/scored.del.txt.gz','cnsolidate/random-forest/scored.dup.txt.gz'];       # take only score bigger than $score_th in missed_calls_nexons()
+    $$self{wes}    = ['final.paper/random-forest/scored.del.txt.gz','final.paper/random-forest/scored.dup.txt.gz'];     # includes DNM and all calls, take only score>=0.98 (the "good" set)
+    $$self{wes_dup_th} = 0.78;
+    $$self{wes_del_th} = 0.63;
+    $$self{multicov}   = 'bam-sex.v5.txt';      # bedtools multicov outputs
+    $$self{dels_accessible} = 'percentage-of-small-dels-accessible.v2';
+    $$self{small_cnv_dist}  = '1000gp/cnvs.txt.gz';     # chr beg end, 1000GP
+    $$self{dnm_ptvs}        = 'DNM-PTVs-3303-genes.2020-01-14.txt';    # de novo protein truncating variants from DDD and other studies (Kaitlin, forPetr_3303genes_counts_wPTVdnm31k_2020_01_14.txt)
+
+    $$self{clean_set_dir} = 'final.paper/refined.fine-0.95/';
+
+    # used by pre_vs_nonprescreened()
+    $$self{array_previously_done} = 'smpl-array_done-center.txt';
+    $$self{probands}  = 'wes.trio.probands.txt';    # 9859 samples
+    $$self{big_set}   = 'final.paper/refined.fine-0.95/all.txt';
+    $$self{clean_set} = 'final.paper/refined.fine-0.95/filtered.txt';
+
+    # used by dd_genes() and cnv_lenghts()
+    #   $$self{clean_set_dir}
+    $$self{dd_genes}  = 'DDGP.2020-10-29/DDG2P.2020-10-29.mono.genes.CDS.merged.txt.gz';
+    $$self{inc_dsg}   = 'DDGP.2020-10-29/DDG2P.2020-10-29.increased-dosage.genes.CDS.txt';   # genes with a phenotype for increased copy number
+    $$self{all_genes} = 'DDGP.2020-10-29/all.CDS.baits.txt.gz';
+    $$self{gnomad}    = 'gnomAD-SV/gnomad-CNVs.grch37.baits.txt.gz';
+    $$self{ccdg}      = 'ccdg-SV/ccdg-CNVs.grch37.baits.txt.gz';
+
+    # Genes used for clinical filtering, filtered for probable/confirmed:
+    #   monoallelic,mosaic,biallelic,x-linked_dominant,x-linked_over-dominance,hemizygous
+    #   https://github.com/jeremymcrae/clinical-filter/blob/master/clinicalfilter/inheritance.py#L362
+    $$self{ddg2p_genes}  = 'DDGP.2020-10-29/DDG2P.2020-10-29.all-confirmed-probable.genes.CDS.merged.txt.gz';
+
+    # converved non-coding elements
+    $$self{nce}      = 'noncoding_elements_ddd.bed';
+    $$self{decipher} = 'decipher_dump.2020-07-13.1550059941.txt';
+    $$self{dgv_cnvs} = 'dgv/cnvs.txt.gz';
+
+    # How many were not in DECIPHER prior to this?
+    $$self{old_decipher} = 'decipher_dump.130219.1550059941.txt';
+
+    # recessive genes
+    $$self{biallelic_genes} = 'DDGP.2020-10-29/DDG2P.2020-10-29.bi.genes.chr-beg-end.txt.gz';
+    $$self{uber_vcfs} = 'ddd_data';
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-cnv-paper\n" .
+        "Options:\n" .
+        "   -o, --outdir <dir>          Output directory\n" .
+        "   -u, --update <type>         truth+wes|graph\n" .
+        "       --wes-ths <dup,del>     Thresholds to apply for WES data [0.78,0.63]\n" .
+        "\n";
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-u' or $arg eq '--update' ) { $$self{update}=shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        if (                 $arg eq '--wes-ths' ) { ($$self{wes_dup_th},$$self{wes_del_th})=split(/,/,shift(@ARGV)); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    print STDERR "Using the WES thresholds: dup=$$self{wes_dup_th}, del=$$self{wes_del_th}\n";
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    if ( $$self{update} )
+    {
+        $self->cmd("rm -rf $$self{outdir}/.jobs $$self{outdir}/missed-calls-nexons.*/.jobs $$self{outdir}/wes-exon-sensitivity/.jobs");
+        if ( $$self{update} eq 'graph' )
+        {
+            # only redo the graph, data remain the same
+            for my $truth (keys %{$$self{truth}})
+            {
+                $self->cmd("mv $$self{outdir}/missed-calls-nexons.$truth $$self{outdir}/missed-calls-nexons.$truth.part");
+            }
+        }
+        elsif ( $$self{update} eq 'truth+wes' )
+        {
+            $self->cmd("rm -rf $$self{outdir}/missed-calls-nexons.*");
+        }
+        else { $self->throw("The -u $$self{update} option not recognised\n"); }
+        $self->all_done;
+    }
+
+    # The aCGH-vs-WES stacked barplot: called and missed(DUPs and DELs) vs number of affected exons.
+    for my $truth (keys %{$$self{truth}})
+    {
+        $self->spawn('missed_calls_nexons',"$$self{outdir}/missed-calls-nexons.$truth",$truth,$$self{truth}{$truth});
+    }
+    $self->wait;
+
+    # A more sophisticated version of the "Estimated 3-probe sensitivity" graph. See comments below in the code.
+    # This is through the nreads round trip for WES.
+    #   $self->estimated_three_probe_sensitivity();
+    #
+    # And this simply counting sensitivity in exons
+    $self->estimated_three_probe_sensitivity_simpler_wes("$$self{outdir}/platform-sensitivity-simpler");
+
+    $self->spawn('pre_vs_nonprescreened',"$$self{outdir}/pre-vs-nonprescreened");
+    $self->spawn('dd_genes_del_dup',"$$self{outdir}/dd-genes-del-dup");
+    #    $self->spawn('conserved_elements',"$$self{outdir}/conserved-elements");
+    #    $self->spawn('cnv_lengths',"$$self{outdir}/cnv-lengths");  # not a nice looking graph
+    #    $self->spawn('gnomad_overlap',"$$self{outdir}/gnomad");
+    $self->wait;
+
+    $self->spawn('multi_entire_partial',"$$self{outdir}/multi-entire-partial",$$self{clean_set});
+    $self->spawn('entire_vs_partial',"$$self{outdir}/entire-vs-partial");
+    $self->spawn('entire_vs_partial',"$$self{outdir}/entire-vs-partial.multi",multi=>1);
+    $self->spawn('recurrent_genes',"$$self{outdir}/recurrent-genes");
+    $self->spawn('loss_of_function',"$$self{outdir}/lof.601.txt",$$self{clean_set} );
+    $self->spawn('loss_of_function',"$$self{outdir}/lof.721.txt",$$self{big_set});
+    $self->wait;
+
+    $self->spawn('calls_in_decipher',"$$self{outdir}/calls-in-old-decipher.txt",decipher=>$$self{old_decipher},calls=>"$$self{outdir}/lof.601.txt");
+    $self->spawn('decipher_report',"$$self{outdir}/decipher-report.601.txt","$$self{outdir}/lof.601.txt");
+    $self->spawn('decipher_report',"$$self{outdir}/decipher-report.721.txt","$$self{outdir}/lof.721.txt");
+    $self->spawn('recessive_cnvs',"$$self{outdir}/recessive.txt");
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr;
+    if ( ref($file) eq 'HASH' )
+    {
+        if ( exists($$file{hdr}) ) { $hdr = $$file{hdr}; }
+        else { $self->throw("Incorrect usage\n"); }
+    }
+    if ( !defined $hdr ) { $hdr = (`zless $file | head -1`)[0]; }
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+
+
+# Take all DECIPHER calls (without chrX), determine the number of
+# exons, show how many were called by CNsolidate and WES. For
+# CNsolidate take all that entered clinical filtering (in uber VCFs) and
+# for WES all good calls (>=0.98) but not refined (as that is a post-filtering
+# step to remove non-pathogenic CNVs). Are there any marked as not-DNMs?
+#
+#   zcat decipher/decipher.cols.acgh-wes.txt.gz | awk '$1=="X"' |wc -l  # 0
+#   cat final.paper/refined/filtered.txt | grep -v ^# |wc -l            # 451
+#   cat final.paper/refined/filtered.txt | awk '$2=="X"' |wc -l         #  28
+#
+# Outputs:
+#   # The aCGH-vs-WES stacked barplot graph "CNVs missed by aCGH and WES"
+#   cnv-paper.adjw0.5/missed-calls-nexons.decipher/missed-vs-called-nexons.decipher.png
+#
+#   # Truth-set CNVs annotated with "called" and "nexons"
+#   cnv-paper.adjw0.5/missed-calls-nexons.decipher/called-by-acgh-nexons.txt.gz
+#   cnv-paper.adjw0.5/missed-calls-nexons.decipher/called-by-wes-nexons.txt.gz
+#
+sub missed_calls_nexons
+{
+    my ($self,$outdir,$key,$truth) = @_;
+
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    if ( !$self->is_finished("$dir/counts.done") )
+    {
+        # Count the number of exons hit by the CNVs
+        my $cnv2nexon = {};     # number of exons in truth-set CNVs
+        my $idx = $self->col_names($truth);
+        open(my $in,"zless $truth |") or $self->throw("zless $truth: $!");
+        open(my $out,"| gzip -c > $dir/truth.txt.gz") or $self->throw("gzip -c > $dir/truth.txt.gz: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            my $key = $col[$$idx{chr}].'-'.$col[$$idx{beg}].'-'.$col[$$idx{end}].'-'.$col[$$idx{smpl}].'-'.$col[$$idx{type}];
+            $$cnv2nexon{$key} = 0;
+            print $out join("\t",$col[$$idx{chr}],$col[$$idx{beg}],$col[$$idx{end}],$col[$$idx{smpl}],$col[$$idx{type}],$key)."\n";
+        }
+        close($in) or $self->throw("close failed: zless $truth");
+        close($out) or $self->throw("close failed: gzip -c > $dir/truth.txt.gz");
+
+        my $cmd = qq[annot-regs -s $dir/truth.txt.gz -d $$self{exons} -c 1,2,3:1,2,3 -t 6:6];
+        print STDERR "$cmd\n";
+        open($in,"$cmd |") or $self->throw("$cmd: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            if ( $col[-1] eq '.' ) { next; }
+            for my $cnv (split(/,/,$col[-1])) { $$cnv2nexon{$cnv}++; }
+        }
+        close($in) or $self->throw("close failed: $cmd");
+
+
+        # In order to evaluate the sensitivity in aCGH calls, filter the CNsolidate callset at the default cutoff of wscore>=0.3.
+        # The default score of 0.5 does not let through any of the truth set calls.
+        open($out,"| gzip -c > $dir/acgh.txt.gz") or $self->throw("gzip -c > $dir/acgh.txt.gz: $!");
+        for my $acgh (@{$$self{acgh2M}})
+        {
+            my $score    = 'adjw_score';
+            my $score_th = 0.5;
+
+            my $idx = $self->col_names($acgh);
+            if ( !exists($$idx{$score}) ) { $self->throw("No such key '$score' in $acgh\n"); }
+            if ( !exists($$idx{start}) ) { $self->throw("No such key 'start' in $acgh\n"); }
+            if ( !exists($$idx{stop}) ) { $self->throw("No such key 'stop' in $acgh\n"); }
+            if ( !exists($$idx{sanger_id}) ) { $self->throw("No such key 'sanger_id' in $acgh\n"); }
+            if ( !exists($$idx{type}) ) { $self->throw("No such key 'type' in $acgh\n"); }
+            open(my $in,"zless $acgh |") or $self->throw("zless $acgh: $!");
+            while (my $line=<$in>)
+            {
+                if ( $line=~/^#/ ) { next; }
+                my @col = split(/\t/,$line);
+                chomp($col[-1]);
+                if ( $col[$$idx{$score}] < $score_th ) { next; }
+                print $out join("\t",$col[$$idx{chr}],$col[$$idx{start}],$col[$$idx{stop}],$col[$$idx{sanger_id}],$col[$$idx{type}])."\n";
+            }
+            close($in) or $self->throw("close failed: zless $acgh");
+        }
+        close($out) or $self->throw("close failed: gzip -c > $dir/acgh.txt.gz");
+
+
+        # Find out which truth-set CNVs were called by CNsolidate
+        $cmd = qq[annot-regs -s $dir/acgh.txt.gz -d $dir/truth.txt.gz -c 1,2,3:1,2,3 -m 4,5:4,5 -t acgh:acgh];
+        print STDERR "$cmd\n";
+        open($in,"$cmd |") or $self->throw("$cmd: $!");
+        open($out,"| gzip -c > $dir/called-by-acgh-nexons.txt.gz") or $self->throw("gzip -c > $dir/called-by-acgh-nexons.txt.gz: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            $col[6] = $col[6] eq '.' ? 0 : 1;
+            push @col, $$cnv2nexon{$col[5]};
+            print $out join("\t",@col)."\n";
+        }
+        close($in) or $self->throw("close failed: $cmd");
+        close($out) or $self->throw("close failed: gzip -c > $dir/called-by-acgh-nexons.txt.gz");
+
+
+
+        # Now repeat for WES, taking score >= $$self{wes_dup_th}
+        open($out,"| gzip -c > $dir/wes.txt.gz") or $self->throw("gzip -c > $dir/wes.txt.gz: $!");
+        for my $wes (@{$$self{wes}})
+        {
+            my $idx = $self->col_names($wes);
+            if ( !exists($$idx{type}) ) { $self->throw("The column 'type' not present in $wes\n"); }
+
+            open(my $in,"zless $wes |") or $self->throw("zless $wes: $!");
+            while (my $line=<$in>)
+            {
+                if ( $line=~/^#/ ) { next; }
+                my @col = split(/\t/,$line);
+                chomp($col[-1]);
+                my $th = undef;
+                if ( $col[$$idx{'type'}] eq 'DUP' ) { $th = $$self{wes_dup_th}; }
+                elsif ( $col[$$idx{'type'}] eq 'DEL' ) { $th = $$self{wes_del_th}; }
+                else { $self->throw("Could not tell the type: $line in $wes\n"); }
+                if ( $col[$$idx{'RandomForestScore'}] < $th ) { next; }
+                print $out join("\t",$col[$$idx{chr}],$col[$$idx{beg}],$col[$$idx{end}],$col[$$idx{smpl}],$col[$$idx{type}])."\n";
+            }
+            close($in) or $self->throw("close failed: zless $wes");
+        }
+        close($out) or $self->throw("close failed: gzip -c > $dir/wes.txt.gz");
+
+        # Find out which truth-set CNVs were called by WES
+        $cmd = qq[annot-regs -s $dir/wes.txt.gz -d $dir/truth.txt.gz -c 1,2,3:1,2,3 -m 4,5:4,5 -t wes:wes];
+        print STDERR "$cmd\n";
+        open($in,"$cmd |") or $self->throw("$cmd: $!");
+        open($out,"| gzip -c > $dir/called-by-wes-nexons.txt.gz") or $self->throw("gzip -c > $dir/called-by-wes-nexons.txt.gz: $!");
+        print $out '#'.join("\t",qw(chr beg end smpl type chr_beg_end_smpl_type called nexons))."\n";
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            $col[6] = $col[6] eq '.' ? 0 : 1;
+            push @col, $$cnv2nexon{$col[5]};
+            print $out join("\t",@col)."\n";
+        }
+        close($in) or $self->throw("close failed: $cmd");
+        close($out) or $self->throw("close failed: gzip -c > $dir/called-by-wes-nexons.txt.gz");
+
+        $self->cmd("touch $dir/counts.done");
+    }
+
+    # my $bins  = '-b 3,15,50,100,250';
+    # my $lbl_bins = '3:0-3,15:4-15,50:16-50,100:51-100,250:101-250,>250';
+
+    my $bins  = '-b 1,10,35,70,150,270';
+    my $lbl_bins = '1:0-1,10:2-10,35:11-35,70:36-70,150:71-150,270:151-270,>270';
+
+    $self->cmd(qq[zcat $dir/called-by-wes-nexons.txt.gz  | grep -v ^# |                    cut -f7,8 | awk '\$1==1' | cut -f2 | stats h -a $bins | awk '{OFS="\\t"}{print "wes\\tcalled",\$2,\$3}'      > $dir/called-wes.dat]);
+    $self->cmd(qq[zcat $dir/called-by-wes-nexons.txt.gz  | grep -v ^# | awk '\$5=="DUP"' | cut -f7,8 | awk '\$1==0' | cut -f2 | stats h -a $bins | awk '{OFS="\\t"}{print "wes\\tmissed_dup",\$2,\$3}'  > $dir/missed-dup-wes.dat]);
+    $self->cmd(qq[zcat $dir/called-by-wes-nexons.txt.gz  | grep -v ^# | awk '\$5=="DEL"' | cut -f7,8 | awk '\$1==0' | cut -f2 | stats h -a $bins | awk '{OFS="\\t"}{print "wes\\tmissed_del",\$2,\$3}'  > $dir/missed-del-wes.dat]);
+    $self->cmd(qq[zcat $dir/called-by-acgh-nexons.txt.gz | grep -v ^# |                    cut -f7,8 | awk '\$1==1' | cut -f2 | stats h -a $bins | awk '{OFS="\\t"}{print "acgh\\tcalled",\$2,\$3}'     > $dir/called-acgh.dat]);
+    $self->cmd(qq[zcat $dir/called-by-acgh-nexons.txt.gz | grep -v ^# | awk '\$5=="DUP"' | cut -f7,8 | awk '\$1==0' | cut -f2 | stats h -a $bins | awk '{OFS="\\t"}{print "acgh\\tmissed_dup",\$2,\$3}' > $dir/missed-dup-acgh.dat]);
+    $self->cmd(qq[zcat $dir/called-by-acgh-nexons.txt.gz | grep -v ^# | awk '\$5=="DEL"' | cut -f7,8 | awk '\$1==0' | cut -f2 | stats h -a $bins | awk '{OFS="\\t"}{print "acgh\\tmissed_del",\$2,\$3}' > $dir/missed-del-acgh.dat]);
+
+    $self->cmd(qq[cat $dir/*.dat | mplot bars-stacks -F -o $dir/missed-vs-called-nexons.$key.png,svgz,pdf +o acgh,wes:called,missed_del,missed_dup +title 'CNVs missed by aCGH and WES' +lg 'Missed duplications:c=#007ab9;Missed deletions:c=#f4640d;Called CNVs:c=#878787' +sty mine +xt '$lbl_bins' +hdt 1 +cl h=o,hc=#676767:-:c=#878787:c=#f4640d:c=#007ab9 +xl 'Number of affected exons' +yl 'Count' +wh 6,3.4 +adj left=0.08,right=0.99,bottom=0.2 +sp 0.05 +ab '1:aCGH;WES' +lga 'loc="upper left"' +yr 0,59 +dpi 150]);
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub median_nreads
+{
+    my ($self,$multicov,$chr,$beg,$end) = @_;
+    my @nreads = ();
+    for my $file (@$multicov)
+    {
+        my @lines = $self->cmd("tabix $file $chr:$beg-$end",verbose=>0);
+        my $n = 0;
+        for my $tbx (@lines)
+        {
+            my @col = split(/\t/,$tbx);
+            chomp($col[-1]);
+            $n += $col[-1];
+        }
+        push @nreads,$n;
+    }
+    my @sorted = sort {$a<=>$b} @nreads;
+    return $sorted[int(0.5*scalar @sorted)];
+}
+
+sub _empirical_nreads_sensitivity_logit
+{
+    my ($self,$prefix,$nreads) = @_;
+
+    if ( !exists($$self{logit_x0}) )
+    {
+        # Run logit sensitivity prediction for nread values
+        $self->cmd(qq[. ~/.vrw/r-3.4.0 && cat $prefix/truth-set.missed.reads.txt | grep -v ^# | awk '{printf "%s\\t%s\\n",\$7,\$5}' | rplot logit -o $prefix/nreads-sensitivity.png -F]);
+
+        # Find out the logit sigmoid parameters
+        ($$self{logit_intercept},$$self{logit_x0}) = grep { chomp } $self->cmd("cat $prefix/nreads-sensitivity/logit-params.txt");
+    }
+    my $read_sensitivity = 1.0 / (1 + exp(-($nreads * $$self{logit_x0} + $$self{logit_intercept})));
+    return $read_sensitivity;
+}
+sub _empirical_nreads_sensitivity_histogram
+{
+    my ($self,$prefix,$value) = @_;
+
+    if ( !exists($$self{nreads_histogram}) )
+    {
+        # Run logit sensitivity prediction for nread values
+        my @out = $self->cmd(qq[cat $prefix/truth-set.missed.reads.txt | grep -v ^# | awk '{printf "%s\\t%s\\n",\$7,\$5}' | sort -k1,1g | stats S -n 20]);
+        for my $line (@out)
+        {
+            my @col = split(/\s+/,$line);
+            chomp($col[-1]);
+            push @{$$self{nreads_histogram}},[$col[0],$col[1]];
+        }
+    }
+    my $dat = $$self{nreads_histogram};
+
+    # binary search
+    my $min = 0;
+    my $max = scalar @$dat - 1;
+    my $i = -1;
+    while ( $min<=$max )
+    {
+        $i = int(($max+$min)*0.5);
+        if ( $value < $$dat[$i][0] ) { $max = $i - 1; }
+        elsif ( $value > $$dat[$i][0] ) { $min = $i + 1; }
+        else { last; }
+    }
+    if ( $min >= scalar @$dat or $$dat[$min][0] > $$dat[$max][0] ) { $i = $max; }
+    return $$dat[$i][1];
+}
+sub wes_nreads_to_exon_sensitivity
+{
+    my ($self,$outfile,$prefix) = @_;
+
+    # Calculate the sensitivity:
+    #   P(n-exon CNV is called) = \sum_{x=0}^{\inf} P(n-exon CNV has x reads) * P(CNV with x reads is called,logit prediction)
+    #
+    open(my $out,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    for my $nexon (@{$$self{nexons}})
+    {
+        my $cnt_tot = 0;
+        my @dnsity = ();
+        open(my $in,"zless $prefix/nexon.$nexon.dist.gz |") or $self->throw("zless $prefix/nexon.$nexon.dist.gz: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            chomp($line);
+            my ($beg,$end,$cnt,$density) = split(/\t/,$line);
+            push @dnsity,[$beg,$cnt];
+            $cnt_tot += $cnt;
+        }
+        close($in) or $self->throw("close failed: zless $prefix/nexon.$nexon.dist.gz");
+
+        my $prob = 0;
+        for (my $i=1; $i<@dnsity; $i++)
+        {
+            my $read_density = $dnsity[$i][1]/$cnt_tot/($dnsity[$i][0] - $dnsity[$i-1][0]);
+            my $read_sensitivity = $self->_empirical_nreads_sensitivity_histogram($prefix,$dnsity[$i][0]);
+            $prob += $read_density * $read_sensitivity;
+        }
+        print $out "$nexon\t$prob\n";
+    }
+    close($out) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+
+# Create the distribution of reads in regions spanning 1,2,etc. exons.
+sub calc_exon_read_distrib
+{
+    my ($self,$outfile,$nexon,$multicov) = @_;
+    
+    open(my $out,"| $$self{dist} -n 1e6 | gzip -c > $outfile.part") or $self->throw("$$self{dist} -n 1e6 | gzip -c > $outfile.part: $!");
+    for my $file (@$multicov)
+    {
+        my $cmd = "annot-regs --max-annots 200 -s $$self{outdir}/exons.txt.gz -d $file -c 1,2,3:1,2,3 -H -t 4:5";
+        print STDERR "$cmd\n";
+        open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+        my @buf = ();
+        my $prev_chr = undef;
+        while (my $line=<$in>)
+        {
+            # chomp($line);
+            # print STDERR "IN\t$line\t\tnexon=$nexon\tnbuf=".scalar @buf."\n";
+            # for my $x (@buf)
+            # {
+            #     print STDERR "\t\t$$x[0]\t$$x[1]\t$$x[2]\t$$x[3]\t";
+            #     if ( ref($$x[4]) eq 'ARRAY' ) { print STDERR join(',',@{$$x[4]}); }
+            #     else {print STDERR ".";}
+            #     print STDERR "\n";
+            # }
+            # if (@buf) {print STDERR "\n";}
+
+            my ($chr,$beg,$end,$nreads,$exon_list) = split(/\t/,$line);    # chr,beg,end,nreads,[list of beg-end exons]
+            chomp($exon_list);
+
+            # New chromosome? Flush everything
+            if ( !defined $prev_chr or $chr ne $prev_chr )
+            {
+                $self->_calc_exon_read_distrib_flush(\@buf,$out,$nexon,1);
+            }
+            $prev_chr = $chr;
+
+            # This bait that does not overlap any exon: unless it's in the middle, discard it
+            if ( $exon_list eq '.' )
+            {
+                if ( !@buf ) { next; }   # first bait && does not overlap an exon
+                push @buf,[$chr,$beg,$end,$nreads,$exon_list];
+                $self->_calc_exon_read_distrib_flush(\@buf,$out,$nexon,0);
+                next;
+            }
+
+            my @exons = split(/,/,$exon_list);  # 5% of baits overlap multiple exons
+            push @buf,[$chr,$beg,$end,$nreads,\@exons];
+
+            $self->_calc_exon_read_distrib_flush(\@buf,$out,$nexon,0);
+        }
+        close($in) or $self->throw("close failed: $cmd");
+
+        $self->_calc_exon_read_distrib_flush(\@buf,$out,$nexon,1);
+    }
+    close($out) or $self->throw("close failed: $$self{dist} -n 1e6 | gzip -c > $outfile.part");
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub _calc_exon_read_distrib_flush
+{
+    my ($self,$buf,$fh,$nflush_exon,$flush_all) = @_;
+
+    my $nreads = 0;
+    my $exons  = {};
+    for (my $i=0; $i<@$buf; $i++)
+    {
+        my $nnew = 0;
+        my $nexons = scalar keys %$exons;
+
+        # Look ahead: how many exons there are if we include this bait?
+        if ( ref($$buf[$i][4]) eq 'ARRAY' )     # this bait overlaps an exon
+        {
+            for my $ex (@{$$buf[$i][4]})
+            {
+                if ( !exists($$exons{$ex}) ) { $nnew++; }
+            }
+        }
+
+        # Can this bait be flushed? Not if there are not enough exons and the new bait 
+        # does adds not add anything new
+        if ( $nexons<$nflush_exon && !$nnew )
+        {
+            if ( ref($$buf[$i][4]) eq 'ARRAY' )
+            {
+                for my $ex (@{$$buf[$i][4]}) { $$exons{$ex}++; }
+            }
+            $nreads += $$buf[$i][3];
+            next;
+        }
+
+        # Can we flush anything at this point? Yes, if we have the right number of exons
+        # and the new bait either brings more or it does not overlap an exon.
+        if ( $nexons>=$nflush_exon && ($nnew or ref($$buf[$i][4]) ne 'ARRAY') )
+        {
+            if ( $nexons==$nflush_exon )
+            {
+                print $fh $nreads."\n";
+                # print STDERR "OUT\t$nreads\n";
+            }
+            my $j;
+            for ($j=0; $j<$i; $j++)
+            {
+                if ( ref($$buf[$j][4]) eq 'ARRAY' )
+                {
+                    for my $ex (@{$$buf[$j][4]})
+                    {
+                        if ( !exists($$exons{$ex}) or $$exons{$ex} <= 0 ) { $self->throw("uh: j=$j  $ex .. $$exons{$ex}"); }
+                        if ( --$$exons{$ex} == 0 ) { delete($$exons{$ex}); }
+                    }
+                }
+                $nreads -= $$buf[$j][3];
+                
+                # print STDERR "\t---\tj=$j\t$$buf[$j][0]\t$$buf[$j][1]\t$$buf[$j][2]\t$$buf[$j][3]\n";
+
+                # Removed enough baits already?
+                if ( $nnew + scalar keys %$exons <= $nflush_exon ) { last; }
+            }
+            if ( $j+1 > @$buf ) { $self->throw("uh: taking too much .. i=$i  j+1=$j+1  nbuf=".(scalar @$buf)."\n"); }
+            splice(@$buf,0,$j+1);
+            $i -= $j+1;
+        }
+        if ( !@$buf ) { return; }
+        
+        # Eat leading dots, ie baits with no overlapping exons
+        if ( ref($$buf[0][4]) ne 'ARRAY' )
+        {
+            while ( @$buf && ref($$buf[0][4]) ne 'ARRAY' )
+            {
+                # print STDERR "\txxx\ti=$i\t$$buf[0][0]\t$$buf[0][1]\t$$buf[0][2]\t$$buf[0][3]\n";
+                $nreads -= $$buf[0][3];
+                splice(@$buf,0,1);
+                if ( $i>0 ) { $i--; }
+            }
+            if ( !@$buf ) { return; }
+        }
+        if ( ref($$buf[$i][4]) eq 'ARRAY' )
+        {
+            for my $ex (@{$$buf[$i][4]}) { $$exons{$ex}++; }
+        }
+        $nreads += $$buf[$i][3];
+    }
+    if ( $flush_all ) { @$buf = (); }
+}
+
+# Add the median number of reads into the truth set calls
+sub truth_set_nreads
+{
+    my ($self,$outfile,$args,$multicov) = @_;
+    my $nreads = $self->median_nreads($multicov,$$args{chr},$$args{beg},$$args{end});
+    open(my $out,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    print $out $nreads."\n";
+    close($out) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+# 
+sub estimated_three_probe_sensitivity_simpler_wes
+{
+    my ($self,$outdir) = @_;
+    
+    $self->cmd("mkdir -p $outdir");
+    $self->cmd("mkdir -p $outdir.dd");
+    
+    # The aCGH arrays: 3-probe sensitivity estimate
+    $self->set_limits(cpus=>2);
+    for my $npr (2,3,5)
+    {
+        for my $plt (qw(60k 180k 2M WES))
+        {
+            my $out = "$outdir/$plt.$npr";
+            $self->spawn('run_cmd',"$out.txt","$$self{dels_accessible} -c $$self{small_cnv_dist} -N $npr -n 500000 -o $out -p $plt > $out.txt.part && mv $out.txt.part $out.txt"); 
+
+            $out = "$outdir.dd/$plt.$npr";
+            $self->spawn('run_cmd',"$out.txt","$$self{dels_accessible} -c $$self{small_cnv_dist} -N $npr -n 500000 -o $out -p $plt -e $$self{dd_genes} > $out.txt.part && mv $out.txt.part $out.txt"); 
+        }
+    }
+    $self->wait;
+    $self->set_limits(cpus=>undef);
+
+
+    # The experimental WES sensitivity
+    $self->spawn('experimental_wes_sensitivity',"$outdir/exp.WES.txt","$outdir/tmp");
+    $self->wait;
+
+    $self->spawn('run_cmd',"$outdir/sensitivity.png", qq[./plot-platform-sensitivity.py --title '3,5-probe accessibility, all genes' $outdir $outdir/sensitivity.part && mv $outdir/sensitivity.part.png $outdir/sensitivity.png]);
+    $self->spawn('run_cmd',"$outdir.dd/sensitivity.dd.png", qq[./plot-platform-sensitivity.py --title 'DN-DD genes' $outdir.dd $outdir.dd/sensitivity.part && mv $outdir.dd/sensitivity.part.png $outdir.dd/sensitivity.dd.png]);
+    $self->spawn('run_cmd',"$outdir/cnv-sizes.png",qq[zcat $$self{small_cnv_dist} | awk '{print \$3-\$2+1}' | stats h -l 45 | cut -f2,3 | mplot xy -F -o $outdir/cnv-sizes.part.png +ys log +xs log +sty mine +xl 'CNV size' +yl 'Count' +title 'Size distribution of simulated CNVs' +wh 4,4 +adj bottom=0.16,left=0.16,right=0.99 +cl black && mv $outdir/cnv-sizes.part.png $outdir/cnv-sizes.png]);
+    $self->wait;
+}
+
+
+sub experimental_wes_sensitivity
+{
+    my ($self,$outfile,$tmpdir) = @_;
+
+    $self->cmd("mkdir -p $tmpdir");
+
+    # Create a version of the exon files with beg-end coordinate in the 4th column
+    $self->cmd(qq[zcat $$self{exons} | cut -f1-3 | sort -k1,1d -k2,2n -k3,3n | bedtools merge | awk '{printf "%s\\t%s\\t%s\\t%s-%s\\n",\$1,\$2,\$3,\$2,\$3}' | gzip -c > $tmpdir/exons.txt.gz]);
+
+    # Annotate the truth-set CNVs with the number of exons
+    my $cmd = qq[annot-regs -s $tmpdir/exons.txt.gz -d $$self{truth}{decipher} -c 1,2,3:chr,beg,end -t 4:nexons];
+    print STDERR "$cmd\n";
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+    open(my $out,"| gzip -c > $tmpdir/truth.txt.gz") or $self->throw("gzip -c > $tmpdir/truth.txt.gz");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ )
+        {
+            print $out $line;
+            next;
+        }
+        chomp($line);
+        my @col  = split(/\t/,$line);
+        $col[-1] = $col[-1] eq '.' ? 0 : scalar split(/,/,$col[-1]);
+        print $out join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: $tmpdir/truth.txt.gz");
+
+    # Annotate truth-set CNVs with whether they were called or not. Use the cutoff determined from aCGH.
+    if ( !($$self{wes}[0]=~/del/) or !($$self{wes}[1]=~/dup/) ) { $self->throw("Uh: improve me, wanted del and dup"); }
+    $cmd =
+        qq[(zcat $$self{wes}[0] | awk '\$1~/^#/ || \$6>=$$self{wes_del_th}'; zcat $$self{wes}[1] | awk '\$6>=$$self{wes_dup_th}')] .
+        qq[ | annot-regs -d $tmpdir/truth.txt.gz -c chr,beg,end -m smpl -t called];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    open($out,"| gzip -c > $tmpdir/truth.called.txt.gz") or $self->throw("gzip -c > $tmpdir/truth.called.txt.gz");
+    while (my $line=<$in>)
+    {   
+        if ( $line=~/^#/ )
+        {   
+            print $out $line;
+            next;
+        }   
+        chomp($line);
+        my @col  = split(/\t/,$line);
+        $col[-1] = $col[-1] eq '.' ? 0 : 1;
+        print $out join("\t",@col)."\n";
+    }   
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: $tmpdir/truth.called.txt.gz");
+
+    # Calculate the empirical sensitivity
+    $self->cmd(qq[zcat $tmpdir/truth.called.txt.gz | grep -v ^# | cut -f7,8 | sort -k1,1n | stats S -n 15 -i | awk '\$1>0' > $outfile.part]);
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub pre_vs_nonprescreened
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my %dat = ();
+    my %probs = map {$_=>1} grep {chomp} $self->cmd(qq[cat $$self{probands}]);
+    my @lines = $self->cmd(qq[cat $$self{array_previously_done}]);
+    my %smpl2done = ();
+    for my $line (@lines)
+    {
+        chomp($line);
+        my ($smpl,$done,$center) = split(/\t/,$line);
+        # if ( $center eq 'DDD-CAR' or $center eq 'DDD-LRI' or $center eq 'DDD-SGS' or $center eq 'DDD-WOS' or $center eq 'DDD-NIG' ) { next; }
+        # if ( !($center eq 'DDD-CAR' or $center eq 'DDD-LRI' or $center eq 'DDD-SGS' or $center eq 'DDD-WOS' or $center eq 'DDD-NIG') ) { next; }
+        if ( !exists($probs{$smpl}) ) { next; }
+        if ( $done ne '0' && $done ne '1' ) { $self->throw("wrong format: $$self{array_previously_done} .. $line"); }
+        $done = $done eq '1' ? 'done' : 'not';
+        $smpl2done{$smpl} = $done;
+        $dat{tot_smpl}{$done}++;
+    }
+
+    my ($idx) = $self->col_names($$self{clean_set});
+    @lines = $self->cmd(qq[zless $$self{clean_set} | grep -v ^#]);
+    for my $line (@lines)
+    {
+        chomp($line);
+        my @col = split(/\t/,$line);
+        my $smpl = $col[$$idx{smpl}];
+        if ( !exists($smpl2done{$smpl}) ) { next; }
+        my $done = $smpl2done{$smpl};
+        my $type = $col[$$idx{type}];
+        $dat{$done}{$type}++;
+    }
+
+    open(my $fh,'>',"$dir/pre-nonpre.txt") or $self->throw("$dir/pre-nonpre.txt: $!");
+    print $fh "# $$self{clean_set}\n";
+    print $fh "# type\tnCNV\tnSmpl\trate\n";
+    printf $fh "array_done\t%d\t%d\t%.1f\n", ($dat{done}{DEL}+$dat{done}{DUP}),$dat{tot_smpl}{done},100.*($dat{done}{DEL}+$dat{done}{DUP})/$dat{tot_smpl}{done};
+    printf $fh "array_not_done\t%d\t%d\t%.1f\n", ($dat{not}{DEL}+$dat{not}{DUP}),$dat{tot_smpl}{not},100.*($dat{not}{DEL}+$dat{not}{DUP})/$dat{tot_smpl}{not};
+    close($fh) or $self->throw("close failed: $dir/pre-nonpre.txt\n");
+
+    open($fh,'>',"$dir/pre-nonpre.dup-del.txt") or $self->throw("$dir/pre-nonpre.dup-del.txt: $!");
+    print $fh "# $$self{clean_set}\n";
+    print $fh "# cnv_type\ttype\tnCNV\tnSmpl\trate\n";
+    printf $fh "DUPs\tNon-prescreened\t%d\t%d\t%.2f\n", $dat{not}{DUP},$dat{tot_smpl}{not},100.*$dat{not}{DUP}/$dat{tot_smpl}{not};
+    printf $fh "DELs\tNon-prescreened\t%d\t%d\t%.2f\n", $dat{not}{DEL},$dat{tot_smpl}{not},100.*$dat{not}{DEL}/$dat{tot_smpl}{not};
+    printf $fh "DUPs\tPrescreened\t%d\t%d\t%.2f\n", $dat{done}{DUP},$dat{tot_smpl}{done},100.*$dat{done}{DUP}/$dat{tot_smpl}{done};
+    printf $fh "DELs\tPrescreened\t%d\t%d\t%.2f\n", $dat{done}{DEL},$dat{tot_smpl}{done},100.*$dat{done}{DEL}/$dat{tot_smpl}{done};
+    close($fh) or $self->throw("close failed: $dir/pre-nonpre.dup-del.txt\n");
+
+    # $self->cmd(qq[cat $dir/pre-nonpre.dup-del.txt | grep -v ^# | cut -f1,2,5 | mplot barstack -d tab -F -o $dir/pre-nonpre.dup-del.png +type stack-xlbl-cnt +sty mine +cl '#007ab9,#f4640d' +yl 'De novo CNVs per 100 probands' +wh 6,4 +hdt 1 +la rotation=0,y=-0.03 +dpi 120 +xr -0.75,1.5 +yr 0,8 +adj right=0.99,top=0.96,bottom=0.15,left=0.13 +wd 0.4 +lb 'Prescreened;Non-prescreened' +ec black]);
+
+    open($fh,'>',"$dir/pre-nonpre.dup-del.py") or $self->throw("close failed: $dir/pre-nonpre.dup-del.py");
+    tprint($fh, qq[
+        #!/usr/bin/env python3
+
+        import matplotlib as mpl
+        mpl.use('Agg')
+        import matplotlib.pyplot as plt
+        import itertools
+
+        mpl.rc('text', usetex=True)
+
+        labels = []
+        files = ['$dir/pre-nonpre.dup-del.txt']
+        
+        type = 'stack-xlbl-cnt'
+        direction = 'vertical'
+        barstacks   = []        # defines the order of the stacks
+        
+        xlbl2xval = {}
+        dat = {}
+        max_len = 0
+        for i in range(len(files)):
+            file = open(files[i],'r')
+            for line in file:
+                row = line.rstrip('\\n').split('\\t')
+                if row[0][0] == '#': continue
+                stack = row[0]
+                xlbl  = row[1]
+                cnt   = float(row[4])
+                if xlbl not in xlbl2xval:
+                    xlbl2xval[xlbl] = len(xlbl2xval)
+                xval = xlbl2xval[xlbl]
+                if stack not in dat:
+                    dat[stack] = {}
+                    dat[stack]['xval'] = []
+                    dat[stack]['yval'] = []
+                dat[stack]['xval'] +=  [0] * (xval+1-len(dat[stack]['xval']))
+                dat[stack]['yval'] +=  [0] * (xval+1-len(dat[stack]['yval']))
+                dat[stack]['xval'][xval] = xval
+                dat[stack]['yval'][xval] = cnt
+                if stack not in barstacks: barstacks.append(stack)
+                if max_len < len(dat[stack]['xval']): max_len = len(dat[stack]['xval'])
+        
+        xlbl = [''] * max_len
+        for lbl in xlbl2xval: xlbl[xlbl2xval[lbl]] = lbl
+        
+        for stack in dat:
+            dat[stack]['xval'] = range(max_len)
+            dat[stack]['xlbl'] = xlbl
+            dat[stack]['yval'] +=  [0] * (max_len-len(dat[stack]['yval']))
+        
+        wh = 4,3
+        wd = 0.4
+        if wd==None: wd = 1./(2 + len(barstacks))
+        sp = 0  # Small space between bars as fraction of wd; +sp 0.1
+        
+        fcolor = None
+        ecolor = 'black'
+        colors = '#007ab9,#f4640d'
+        if colors==None or colors=='default': colors = '#337ab7,#f0ad4e,#5cb85c,#5bc0de,#d9534f,grey,black'
+        elif colors=='sanger': colors = '#01579B,#FD8230,#1B5E20,#039BE5,#9C2222,grey,black'
+        colors = colors.split(',')
+        
+        plt_args = {}       # for example: +pa "mec='grey',mfc='grey'"
+        
+        if direction=='vertical':
+            lbl_args = {'rotation':35,'ha':'right','multialignment':'center'} # for example: "rotation=35,ha='right',ma='center',fontsize=9",y=-0.05
+        else:
+            lbl_args = {'ha':'right','multialignment':'center'} # for example: "rotation=35,ha='right',ma='center',fontsize=9"
+        lbl_args = {'rotation':0,'y':-0.03}
+        
+        fig, ax1 = plt.subplots(1, 1, figsize=wh)
+        for i in range(len(barstacks)): 
+            bardat = dat[barstacks[i]]
+            plt_args['color'] = colors[i%len(colors)]
+        
+            if ecolor!=None:
+                plt_args['edgecolor'] = ecolor
+            else:
+                plt_args['linewidth'] = 0
+            if fcolor!=None: plt_args['color'] = fcolor
+            plt_args['label'] = barstacks[i]
+        
+            # stack-xlbl-cnt
+            xdat = [x-wd*0.5 for x in bardat['xval']]
+            if i==0:
+                bardat['ytop'] = bardat['yval']
+            else:
+                bardat['bottom'] = dat[barstacks[i-1]]['ytop']
+                bardat['ytop']   = []
+                for j in range(len(bardat['bottom'])):
+                    bardat['ytop'].append( bardat['bottom'][j] + bardat['yval'][j] )
+                plt_args['bottom'] = bardat['bottom']
+            ydat = bardat['yval']
+            ax1.bar(xdat,ydat,wd,**plt_args)
+            if i>0:
+                for j in range(len(bardat['bottom'])): ydat[j] += bardat['bottom'][j]
+
+        plt_args['bottom'] = [y for y in ydat]
+        plt_args['color'] = 'white'
+        plt_args['label'] = None
+        plt_args['linestyle'] = '--'
+        ydat = [0,ydat[0]-ydat[1]]
+        ax1.bar(xdat,ydat,wd,**plt_args)
+        
+        y0 = plt_args['bottom'][1]
+        y1 = ydat[1] + plt_args['bottom'][1]
+        yd = (y1-y0)*0.05
+        x0 = 1.1
+        x = [x0,x0+0.1,x0+0.1,x0]
+        y = [y0+yd,y0+yd,y1-yd,y1-yd]
+        ax1.plot(x,y,color='black',linewidth=1.5)
+        y = [0+yd,0+yd,y0-yd,y0-yd]
+        ax1.plot(x,y,color='black',linewidth=1.5)
+        ax1.annotate('Detected by a\\nclinical 60k array',xy=(x0+0.2,(y0+y1)*0.5),xycoords='data',va='center',ha='left')
+        ax1.annotate('Additional yield\\nof WES',xy=(x0+0.2,y0*0.5),xycoords='data',va='center',ha='left')
+
+        ax1.set_xticks([x-wd*0.5 for x in dat[barstacks[0]]['xval']])
+        ax1.set_xticklabels(dat[barstacks[0]]['xlbl'],**lbl_args)
+        
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.get_xaxis().tick_bottom()
+        ax1.get_yaxis().tick_left()
+        ax1.spines['bottom'].set_color('grey')
+        ax1.spines['left'].set_color('grey')
+        mpl.rcParams['text.color'] = '555555'
+        #args = {'color':'#555555'}
+        ax1.patch.set_visible(False)
+
+        ax1.xaxis.set_tick_params(length=0)
+        
+        ylim = (0,10)
+        if ylim!=None: ax1.set_ylim(ylim)
+        
+        xlim = (-0.75,1.5)
+        if xlim!=None: ax1.set_xlim(xlim)
+        
+        ylabel = r'Number of \\textit{de novo} CNVs per 100 probands'
+        if ylabel!=None: ax1.set_ylabel(ylabel,labelpad=10)
+        
+        plt.legend(numpoints=1,markerscale=1,loc=(0.15,0.8),prop={'size':10},frameon=False)
+        
+        adjust = {'right':0.8,'top':0.96,'bottom':0.15,'left':0.13}
+        if adjust!=None: plt.subplots_adjust(**adjust)        # for example: bottom=0.2,left=0.1,right=0.95
+        
+        plt.savefig('$dir/pre-nonpre.dup-del.png',dpi=150)
+        plt.savefig('$dir/pre-nonpre.dup-del.svgz')
+        plt.close()
+    ]);
+    close($fh) or $self->throw("close failed: $dir/pre-nonpre.dup-del.py");
+    $self->cmd("python3 $dir/pre-nonpre.dup-del.py");
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub dd_genes_del_dup
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+    
+    my $sets =
+    {
+        'gnomad' =>
+        {
+            file => $$self{gnomad},
+            cols => '1,2,3',
+        },
+        'ccdg' =>
+        {
+            file => $$self{ccdg},
+            cols => '1,2,3',
+        },
+        'clean' =>
+        {
+            file => "$$self{clean_set_dir}/filtered.txt",
+            cols => '1,2,3:chr,beg,end',
+        },
+        # 'all' =>
+        # {
+        #     file => "$$self{clean_set_dir}/all.txt",
+        #     cols => '1,2,3:chr,beg,end',
+        # },
+        'inherited' =>
+        {
+            file => "$$self{clean_set_dir}/inherited.txt.gz",
+            cols => '1,2,3:2,3,4',
+        },
+    };
+
+    # If half of the accessible genes were DD genes, we'd be interested in how big is the deviation
+    # from 0.5, thus working with binom(..,p=0.5). However, we need to work with binom(..,p=$dd_frac).
+    my $nall_genes = (grep {chomp} $self->cmd(qq[zcat $$self{all_genes} | cut -f4 | sort | uniq | wc -l]))[0];
+    my $ndd_genes  = (grep {chomp} $self->cmd(qq[zcat $$self{dd_genes} | cut -f4 | sort | uniq | wc -l]))[0];
+    my $dd_frac = sprintf "%f",$ndd_genes/$nall_genes;
+
+    my $i = 0;
+    open(my $fh,'>',"$dir/frac-in-dd-genes.dat") or $self->throw("$dir/frac-in-dd-genes.dat");
+    for my $key (qw(ccdg gnomad inherited clean))
+    {
+        my $dat  = $$sets{$key};
+        my $file = $$dat{file};
+        my $cols = $$dat{cols};
+        $$dat{ntot} = (grep {chomp} $self->cmd(qq[zless $file | grep -v ^# | wc -l]))[0];
+        $$dat{ndd}  = (grep {chomp} $self->cmd(qq[annot-regs -s $$self{dd_genes} -d $file -c $cols -t 4:gene | grep -v ^# | awk '\$NF!="."' | wc -l]))[0];
+
+        # enrichment in DD genes
+        ($$dat{pval},$$dat{ci0},$$dat{ci1}) = grep {chomp} $self->cmd(qq[. ~/.vrw/r-3.4.0 && R --slave -e 'x<-binom.test($$dat{ndd},$$dat{ntot},a="t",p=$dd_frac); cat(x\$p.value,x\$conf.int[1],x\$conf.int[2],sep="\\n")']);
+        printf $fh "$key\t$i\t$$dat{ntot}\t$$dat{ndd}\t$$dat{pval}\t%f\t$$dat{ci0}\t$$dat{ci1}\n",$$dat{ndd}/$$dat{ntot};
+
+        if ( $key eq 'clean' )
+        {
+            $i += 0.2;
+            for my $type ('DUP','DEL')
+            {
+                $$dat{ntot} = (grep {chomp} $self->cmd(qq[zless $file | awk '\$1=="$type"' | wc -l]))[0];
+                $$dat{ndd}  = (grep {chomp} $self->cmd(qq[annot-regs -s $$self{dd_genes} -d $file -c $cols -t 4:gene | awk '\$1=="$type"' | awk '\$NF!="."' | wc -l]))[0];
+                ($$dat{pval},$$dat{ci0},$$dat{ci1}) = grep {chomp} $self->cmd(qq[. ~/.vrw/r-3.4.0 && R --slave -e 'x<-binom.test($$dat{ndd},$$dat{ntot},a="t",p=$dd_frac); cat(x\$p.value,x\$conf.int[1],x\$conf.int[2],sep="\\n")']);
+                printf $fh "$type\t$i\t$$dat{ntot}\t$$dat{ndd}\t$$dat{pval}\t%f\t$$dat{ci0}\t$$dat{ci1}\n",$$dat{ndd}/$$dat{ntot};
+                $i += 0.1;
+            }
+        }
+
+        $i++;
+    }
+    close($fh) or $self->throw("close failed: $dir/frac-in-dd-genes.dat");
+
+    # $self->cmd(qq[cat $dir/frac-in-dd-genes.dat | cut -f2,6,7,8 | \
+    #     mplot \
+    #         xy +type xyci -F -o $dir/frac-in-dd-genes.png +dpi 150 +yl 'Fraction of CNVs\\noverlapping a DD gene' \
+    #         +xtl 'CCDG;GnomAD-SV;DDD;de novo DDD' +xt 0,1,2,3 +cl '#878787,#878787,#878787,#878787,#007ab9,#007ab9' \
+    #         +xarg "rotation=30,ha='right',ma='center',fontsize=9" +wh 4,3 +xr -0.7,4.7 +sty mine +adj bottom=0.23,left=0.21,right=0.99]);
+
+    open($fh,'>',"$dir/frac-in-dd-genes.py") or $self->throw("close failed: $dir/frac-in-dd-genes.py");
+    tprint($fh, qq[
+        #!/usr/bin/env python3
+
+        import matplotlib as mpl
+        mpl.use('Agg')
+        import matplotlib.pyplot as plt
+        import itertools
+        import csv
+        import numpy
+        import random
+        csv.register_dialect('tab', delimiter='\t', quoting=csv.QUOTE_NONE)
+        
+        style = 'mine'
+        file  = '$dir/frac-in-dd-genes.dat'
+        type  = 'xyci'
+        
+        colors = '#878787,#878787,#878787,#878787,#007ab9,#f4640d'
+        colors = colors.split(',')
+        
+        xdat = []
+        ydat = []
+        yerr = []
+        with open(file, 'r') as f:
+            reader = csv.reader(f, 'tab')
+            tmp = []
+            for row in reader:
+                if row[0][0] == '#': continue
+                xval = None
+                yval = None
+                xval = float(row[1])
+                yval = float(row[5])
+                yerr.append([[yval-float(row[6])],[float(row[7])-yval]])
+                tmp.append([xval,yval])
+            xdat = [float(x[0]) for x in tmp]
+            ydat = [float(x[1]) for x in tmp]
+        
+        wh = 3.5,3
+        fig, ax1 = plt.subplots(1, 1, figsize=wh)
+        
+        xdat[-1] -= 0.5
+        lbl = ['','','','Both','Duplications','Deletions']
+        plt_args = {'zorder':100,'clip_on':False,'fmt':'o'}
+        for i in range(len(xdat)):
+            j = len(xdat) - i - 1
+            ax1.errorbar([xdat[j]],[ydat[j]],yerr=yerr[j],color=colors[j],label=lbl[j],**plt_args)
+        
+        xt = '0,1,2,3'
+        if xt!=None:
+            tmp = xt.split(',')
+            ax1.set_xticks([float(x) for x in tmp])
+        
+        xlab_args = {'rotation':30,'ha':'right','ma':'center','fontsize':8}
+        xtl = 'Abel 2018;GnomAD-SV;DDD;DDD'
+        if xtl!=None:
+            ax1.xaxis.set_ticks_position('bottom')
+            ax1.set_xticklabels(xtl.split(';'), **xlab_args)
+        ax1.annotate('inherited',xy=(1,0.13),xycoords='data',ha='center',va='bottom',fontsize=8)
+        ax1.plot([0.0,0.0,2.0,2.0],[0.10,0.12,0.12,0.10],'-',color='#555555',lw=1)
+        ax1.annotate('de novo',xy=(3,0.26),xycoords='data',ha='center',va='top',fontsize=8)
+        ax1.plot([2.7,2.7,3.3,3.3],[0.30,0.28,0.28,0.30],'-',color='#555555',lw=1)
+ 
+        ax1.set_xlim(-0.7,3.4)
+        
+        ylabel = 'Fraction of CNVs\\noverlapping a DN-DD gene'
+        if ylabel!=None: ax1.set_ylabel(ylabel,labelpad=10)
+
+        plt.legend(numpoints=1,loc='best',frameon=False)
+
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.get_xaxis().tick_bottom()
+        ax1.get_yaxis().tick_left()
+        ax1.spines['bottom'].set_color('grey')
+        ax1.spines['left'].set_color('grey')
+        mpl.rcParams['text.color'] = '555555'
+        ax1.patch.set_visible(False)
+        
+        adjust = {'bottom':0.22,'left':0.23,'right':0.99,'top':0.95}
+        if adjust!=None: plt.subplots_adjust(**adjust)        # for example: bottom=0.2,left=0.1,right=0.95
+        plt.savefig('$dir/frac-in-dd-genes.png',dpi=150)
+        plt.savefig('$dir/frac-in-dd-genes.svgz')
+        plt.close()
+    ]);
+    close($fh) or $self->throw("close failed: $dir/frac-in-dd-genes.py");
+    $self->cmd("python3 $dir/frac-in-dd-genes.py");
+    
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub dd_genes
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+    
+    my $sets =
+    {
+        'gnomad' =>
+        {
+            file => $$self{gnomad},
+            cols => '1,2,3',
+        },
+        'ccdg' =>
+        {
+            file => $$self{ccdg},
+            cols => '1,2,3',
+        },
+        'clean' =>
+        {
+            file => "$$self{clean_set_dir}/filtered.txt",
+            cols => '1,2,3:chr,beg,end',
+        },
+        'all' =>
+        {
+            file => "$$self{clean_set_dir}/all.txt",
+            cols => '1,2,3:chr,beg,end',
+        },
+        'inherited' =>
+        {
+            file => "$$self{clean_set_dir}/inherited.txt.gz",
+            cols => '1,2,3:2,3,4',
+        },
+    };
+
+    # If half of the accessible genes were DD genes, we'd be interested in how big is the deviation
+    # from 0.5, thus working with binom(..,p=0.5). However, we need to work with binom(..,p=$dd_frac).
+    my $nall_genes = (grep {chomp} $self->cmd(qq[zcat $$self{all_genes} | cut -f4 | sort | uniq | wc -l]))[0];
+    my $ndd_genes  = (grep {chomp} $self->cmd(qq[zcat $$self{dd_genes} | cut -f4 | sort | uniq | wc -l]))[0];
+    my $dd_frac = sprintf "%f",$ndd_genes/$nall_genes;
+
+    my $nall   = (grep {chomp} $self->cmd(qq[zless $$sets{all}{file} | grep -v ^# | wc -l]))[0];
+    my $nclean = (grep {chomp} $self->cmd(qq[zless $$sets{all}{file} | grep -v ^# | wc -l]))[0];
+
+    my $i = 0;
+    open(my $fh,'>',"$dir/frac-in-dd-genes.dat") or $self->throw("$dir/frac-in-dd-genes.dat");
+    for my $key (qw(ccdg gnomad inherited all clean))
+    {
+        my $dat  = $$sets{$key};
+        my $file = $$dat{file};
+        my $cols = $$dat{cols};
+        $$dat{ntot} = (grep {chomp} $self->cmd(qq[zless $file | grep -v ^# | wc -l]))[0];
+        $$dat{ndd}  = (grep {chomp} $self->cmd(qq[annot-regs -s $$self{dd_genes} -d $file -c $cols -t 4:gene | grep -v ^# | awk '\$NF!="."' | wc -l]))[0];
+
+        # enrichment in DD genes
+        ($$dat{pval},$$dat{ci0},$$dat{ci1}) = grep {chomp} $self->cmd(qq[. ~/.vrw/r-3.4.0 && R --slave -e 'x<-binom.test($$dat{ndd},$$dat{ntot},a="t",p=$dd_frac); cat(x\$p.value,x\$conf.int[1],x\$conf.int[2],sep="\\n")']);
+        printf $fh "$key\t$i\t$$dat{ntot}\t$$dat{ndd}\t$$dat{pval}\t%f\t$$dat{ci0}\t$$dat{ci1}\n",$$dat{ndd}/$$dat{ntot};
+        $i++;
+    }
+    close($fh) or $self->throw("close failed: $dir/frac-in-dd-genes.dat");
+    $self->cmd(qq[cat $dir/frac-in-dd-genes.dat | cut -f2,6,7,8 | mplot xy +type xyci -F -o $dir/frac-in-dd-genes.png +dpi 150 +yl 'Fraction of CNVs\\noverlapping a DN-DD gene' +xtl 'CCDG;GnomAD-SV;DDD (inherited);All de novos;Clean set' +xt 0,1,2,3,4 +xarg "rotation=30,ha='right',ma='center',fontsize=9" +wh 4,3 +xr -0.7,4.7 +sty mine +adj bottom=0.23,left=0.21,right=0.99]);
+    
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub cnv_lengths
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+    
+    my $sets =
+    {
+        'gnomad' =>
+        {
+            file => $$self{gnomad},
+            cols => '1,2,3',
+        },
+        'ccdg' =>
+        {
+            file => $$self{ccdg},
+            cols => '1,2,3',
+        },
+        'clean' =>
+        {
+            file => "$$self{clean_set_dir}/filtered.txt",
+            cols => '1,2,3:chr,beg,end',
+        },
+        'all' =>
+        {
+            file => "$$self{clean_set_dir}/all.txt",
+            cols => '1,2,3:chr,beg,end',
+        },
+        'inherited' =>
+        {
+            file => "$$self{clean_set_dir}/inherited.txt.gz",
+            cols => '1,2,3:2,3,4',
+        },
+    };
+
+    my @dat = ();
+    for my $key (qw(ccdg gnomad inherited all clean))
+    {
+        my $dat  = $$sets{$key};
+        my $file = $$dat{file};
+        my $cols = $$dat{cols};
+        $self->cmd(qq[zless $file | awk '{print \$3-\$2}' | stats h -l 10 | cut -f2,3 > $dir/$key.txt]);
+        push @dat,qq[+lb $key $dir/$key.txt];
+    }
+
+    $self->cmd(qq[mplot xy -F -o $dir/cnv-lenghts.png +norm max=1 +xs log ].join(' ',@dat));
+
+    #$self->cmd(qq[cat $dir/frac-in-dd-genes.dat | cut -f2,6,7,8 | mplot xy +type xyci -F -o $dir/frac-in-dd-genes.png +dpi 150 +yl 'Fraction of CNVs\\noverlapping a DN-DD gene' +xtl 'CCDG;GnomAD-SV;DDD (inherited);All de novos;Clean set' +xt 0,1,2,3,4 +xarg "rotation=30,ha='right',ma='center',fontsize=9" +wh 4,3 +xr -0.7,4.7 +sty mine +adj bottom=0.23,left=0.21,right=0.99]);
+    
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub conserved_elements
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my $file = "$$self{clean_set_dir}/all.txt";
+    my $idx  = $self->col_names($file);
+    my $beg  = $$idx{beg} + 1;
+    my $end  = $$idx{end} + 1;
+    my $ncds = $$idx{ncds_genes} + 1;        # overlaps coding sequence
+    my $ncol = 1 + scalar keys %$idx;
+
+    
+    open(my $fh,'>',"$dir/noncoding-conserved.txt") or $self->throw("$dir/noncoding-conserved.txt: $!");
+    print $fh qq[# see ~/wtxt/logs/sandbox/usr/ddd/noncoding-elements/ChangeLog #1573569692\n];
+    close($fh) or $self->throw("close failed: $dir/noncoding-conserved.txt");
+
+    $self->cmd(qq[zless $$self{clean_set_dir}/all.txt | grep -v ^# | awk '\$$ncds==0 && \$$end-\$$beg<1e6' | annot-regs -o 1 -s $$self{nce} -c 1,2,3:2,3,4 -t 4:nce | awk '\$$ncol!="."' >> $dir/noncoding-conserved.txt]);
+
+    #rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub entire_vs_partial
+{
+    my ($self,$outdir,%args) = @_;
+
+    my $multi = $args{multi} ? 1 : 0;
+
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+    my ($fh,$cols,$iaf,$igene,$imode,$iexons,$ieffect,$itype,$idd);
+    
+    # gene list of monoallelic and x-linked DD genes
+    my %dd_gene = map {$_=>1} grep {chomp} $self->cmd("zcat $$self{dd_genes} | cut -f4");
+    
+    # number of exons per gene
+    open(my $in,"zcat $$self{exons} |") or $self->throw("zcat $$self{exons}: $!");
+    my $gene2ncds = {};
+    while(my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        for my $gene (split(/,/,$col[-1]))
+        {
+            $$gene2ncds{$gene}++;
+        }
+    }
+    close($in) or $self->throw("close failed: zcat $$self{exons}");
+
+    my $cmd = qq[annot-regs -s $$self{exons} -d $$self{clean_set} -c 1,2,3:chr,beg,end -t 4:exons --allow-dups];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    my $fname = "$dir/annot.txt";
+    open(my $out,'>',$fname) or $self->throw("$fname: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $line=~/^#/ )
+        {
+            push @col,qw(dd effect);
+            print $out join("\t",@col)."\n";
+            next;
+        }
+    
+        my $dd  = '0';
+        my %cnt = ();
+        for my $gene (split(/,/,$col[-1]))
+        {
+            if ( $gene eq '.' ) { next; }
+            if ( exists($dd_gene{$gene}) ) { $dd = '1'; }
+            $cnt{$gene}++;
+        }
+        my %effect = ();
+        for my $gene (keys %cnt)
+        {
+            if ( $cnt{$gene} eq $$gene2ncds{$gene} ) { $effect{entire}++; }
+            elsif ( $cnt{$gene} < $$gene2ncds{$gene} ) { $effect{partial}++; }
+        }
+        if ( !$multi && scalar keys %cnt != 1 ) { next; }
+
+        my @effect = ();
+        if ( !scalar keys %effect ) { push @effect,'non-genic'; }
+        else
+        {
+            if ( exists($effect{entire}) ) { push @effect,'entire'; }
+            if ( exists($effect{partial}) ) { push @effect,'partial'; }
+        }
+        if ( !@effect ) { $self->throw("Cannot happen: $line\n"); }
+        for my $eff (@effect)
+        {
+            my @out = (@col,$dd,$eff);
+            print $out join("\t",@out)."\n";
+        }
+    }
+    close($out) or $self->throw("close failed: $fname");
+    close($in) or $self->throw("close failed: $cmd");
+
+    ($cols,$itype,$idd,$ieffect) = $self->col_names($fname,qw(type dd effect)); $itype++;$idd++;$ieffect++;
+    my $ndd  = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$idd=="1" && \$$ieffect!="non-genic"' | wc -l]))[0];
+    my $ntot = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | wc -l]))[0];
+    my $ndup_nongenic = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DUP" && \$$ieffect=="non-genic"' | wc -l]))[0];
+    my $ndel_nongenic = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DEL" && \$$ieffect=="non-genic"' | wc -l]))[0];
+    my $ndup_partial_dd    = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DUP" && \$$ieffect=="partial" && \$$idd=="1"' | wc -l]))[0];
+    my $ndup_partial_nondd = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DUP" && \$$ieffect=="partial" && \$$idd=="0"' | wc -l]))[0];
+    my $ndel_partial_dd    = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DEL" && \$$ieffect=="partial" && \$$idd=="1"' | wc -l]))[0];
+    my $ndel_partial_nondd = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DEL" && \$$ieffect=="partial" && \$$idd=="0"' | wc -l]))[0];
+    my $ndup_entire_dd    = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DUP" && \$$ieffect=="entire" && \$$idd=="1"' | wc -l]))[0];
+    my $ndup_entire_nondd = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DUP" && \$$ieffect=="entire" && \$$idd=="0"' | wc -l]))[0];
+    my $ndel_entire_dd    = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DEL" && \$$ieffect=="entire" && \$$idd=="1"' | wc -l]))[0];
+    my $ndel_entire_nondd = (grep { chomp } $self->cmd(qq[cat $fname | grep -v ^# | awk '\$$itype=="DEL" && \$$ieffect=="entire" && \$$idd=="0"' | wc -l]))[0];
+
+    my $ndup_partial = $ndup_partial_dd + $ndup_partial_nondd;
+    my $ndup_entire  = $ndup_entire_dd  + $ndup_entire_nondd;
+    my $ndel_partial = $ndel_partial_dd + $ndel_partial_nondd;
+    my $ndel_entire  = $ndel_entire_dd  + $ndel_entire_nondd;
+    my ($pval_entire) = grep {chomp} $self->cmd(qq[. ~/.vrw/r-3.4.0 && R --slave -e 'x<-fisher.test(rbind(c($ndup_partial,$ndup_entire),c($ndel_partial,$ndel_entire))); cat(x\$p.value,sep="\\n")']);
+
+    my $ndup_dd     = $ndup_partial_dd    + $ndup_entire_dd;
+    my $ndup_nondd  = $ndup_partial_nondd + $ndup_entire_nondd;
+    my $ndel_dd     = $ndel_partial_dd    + $ndel_entire_dd;
+    my $ndel_nondd  = $ndel_partial_nondd + $ndel_entire_nondd;
+    my ($pval_dd) = grep {chomp} $self->cmd(qq[. ~/.vrw/r-3.4.0 && R --slave -e 'x<-fisher.test(rbind(c($ndup_dd,$ndup_nondd),c($ndel_dd,$ndel_nondd))); cat(x\$p.value,sep="\\n")']);
+
+    open($fh,'>',"$dir/entire-vs-partial.txt") or $self->throw("$dir/entire-vs-partial.txt $!");
+    print $fh "ndup_partial\t$ndup_partial\n";
+    print $fh "ndup_entire\t$ndup_entire\n";
+    print $fh "ndel_partial\t$ndel_partial\n";
+    print $fh "ndel_entire\t$ndel_entire\n";
+    print $fh "fisher.test\t$pval_entire\n";
+    print $fh "\n";
+    print $fh "ndup_dd\t$ndup_dd\n";
+    print $fh "ndup_nondd\t$ndup_nondd\n";
+    print $fh "ndel_dd\t$ndel_dd\n";
+    print $fh "ndel_nondd\t$ndel_nondd\n";
+    print $fh "fisher.test\t$pval_dd\n";
+    close($fh) or $self->throw("close failed: $dir/entire-vs-partial.txt");
+
+    my $bname = "$dir/entire-vs-partial";
+    open($fh,'>',"$bname.py") or $self->throw("$bname.py: $!");
+    tprint($fh, qq[
+        #!/usr/bin/env python3
+        
+        import matplotlib as mpl
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        
+        ndup_partial_dd = $ndup_partial_dd
+        ndup_partial_nondd = $ndup_partial_nondd
+        ndel_partial_dd = $ndel_partial_dd
+        ndel_partial_nondd = $ndel_partial_nondd
+        ndup_entire_dd = $ndup_entire_dd
+        ndup_entire_nondd = $ndup_entire_nondd
+        ndel_entire_dd = $ndel_entire_dd
+        ndel_entire_nondd = $ndel_entire_nondd
+
+        part_dup_annot   = "Partial\\n(%d+%d)"%(ndup_partial_dd,ndup_partial_nondd)
+        entire_dup_annot = "entire\\n(%d+%d)"%(ndup_entire_dd,ndup_entire_nondd)
+        part_del_annot   = "Partial\\n(%d+%d)"%(ndel_partial_dd,ndel_partial_nondd)
+        entire_del_annot = "entire\\n(%d+%d)"%(ndel_entire_dd,ndel_entire_nondd)
+
+        ndup_tot = ndup_partial_dd + ndup_partial_nondd + ndup_entire_dd + ndup_entire_nondd
+        ndel_tot = ndel_partial_dd + ndel_partial_nondd + ndel_entire_dd + ndel_entire_nondd
+        
+        ndup_partial_dd    *= 100./ndup_tot 
+        ndup_partial_nondd *= 100./ndup_tot 
+        ndel_partial_dd    *= 100./ndel_tot 
+        ndel_partial_nondd *= 100./ndel_tot 
+        ndup_entire_dd     *= 100./ndup_tot 
+        ndup_entire_nondd  *= 100./ndup_tot 
+        ndel_entire_dd     *= 100./ndel_tot 
+        ndel_entire_nondd  *= 100./ndel_tot 
+
+        x  = 1
+        wd = 0.3
+        sp = 0.05
+        
+        xdat  = [x,x+wd+sp]
+        ydat1 = [ndup_partial_nondd,ndup_entire_nondd]
+        ydat2 = [ndup_partial_dd,ndup_entire_dd]
+        cdat  = ['#007ab9','#878787']
+        
+        x += 1
+        xdat  = xdat  + [x,x+wd+sp]
+        ydat1 = ydat1 + [ndel_partial_nondd,ndel_entire_nondd]
+        ydat2 = ydat2 + [ndel_partial_dd,ndel_entire_dd]
+        cdat  = cdat  + ['#f4640d','#878787']
+        
+        fig, ax1 = plt.subplots(1, 1, figsize=(6,3.5))
+        ax1.bar(xdat,ydat2,wd,color=cdat,edgecolor='black',hatch='///')
+        ax1.bar(xdat,ydat1,wd,bottom=ydat2,color=cdat,edgecolor='black')
+        
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.get_xaxis().tick_bottom()
+        ax1.get_yaxis().tick_left()
+        ax1.spines['bottom'].set_color('grey')
+        ax1.spines['left'].set_color('grey')
+        mpl.rcParams['text.color'] = '555555'
+        ax1.patch.set_visible(False)
+        
+        ax1.set_xlim(1-wd,2.5+wd*2)
+        ax1.set_xticks([x+wd*0.5+sp*0.5 for x in [1,2]])
+        ax1.set_xticklabels(['Duplications','Deletions'],ha='center',y=-0.05)
+        ax1.xaxis.set_tick_params(length=0)
+        ax1.set_ylabel('Fraction of CNVs [%]')
+
+        ax1.annotate(part_dup_annot,xy=(xdat[0],ydat1[0]+ydat2[0]+1),xycoords='data',textcoords='data',fontsize=10,ha='center',va='bottom',color='black')
+        ax1.annotate(entire_dup_annot,xy=(xdat[1],ydat1[1]+ydat2[1]+1),xycoords='data',textcoords='data',fontsize=10,ha='center',va='bottom',color='black')
+        ax1.annotate(part_del_annot,xy=(xdat[2],ydat1[2]+ydat2[2]+1),xycoords='data',textcoords='data',fontsize=10,ha='center',va='bottom',color='black')
+        ax1.annotate(entire_del_annot,xy=(xdat[3],ydat1[3]+ydat2[3]+1),xycoords='data',textcoords='data',fontsize=10,ha='center',va='bottom',color='black')
+        
+        (x,y) = (0,0)
+        (w,h) = (0.1,0.1)
+        rect1 = patches.Rectangle((x,y),w,h, facecolor='white',edgecolor='black',hatch='///')
+        rect2 = patches.Rectangle((x,y+h),w,h, facecolor='white',edgecolor='black')
+        legend = plt.legend([rect1,rect2],['DN-DD genes','Other genes'],numpoints=1,markerscale=2,loc=(0.75,0.8),prop={'size':10},frameon=False)
+        plt.setp(legend.get_texts(), color='black')
+        
+        plt.subplots_adjust(bottom=0.14,right=0.85,top=0.93,left=0.1)
+        
+        plt.savefig('$bname.png',dpi=150)
+        plt.close()
+    ]);
+    close($fh) or $self->throw("close failed: $dir/$bname.py");
+    $self->cmd("python3 $bname.py");
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+sub tprint
+{
+    my ($fh,$text) = @_;
+    my @lines = split(/\n/,$text);
+    my $ntab;
+    for my $line (@lines)
+    {
+        if ( !defined $ntab )
+        {
+            if ( $line=~/^\s*$/ ) { next; }
+            $ntab = ( $line=~/^\s+/ ) ? length($&) : 0;
+        }
+        substr($line,0,$ntab,'');
+        print $fh $line."\n";
+    }
+}
+
+sub recurrent_genes
+{
+    my ($self,$outdir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    # list of recurrent genes in CNVs which affect one gene only - partial or entire, but must overlap a CDS
+    my $nondd_gene = {};
+    my $dd_gene = {};
+
+    # list of recurrent genes in CNVs of any size, just to get some stats
+    my $multi_gene_cnvs  = {};
+    my $nsingle_gene_cnvs = 0;
+
+    # Gene list of monoallelic and x-linked DD genes. Using the extended list of significant genes, the only
+    # difference is USP7 (affected 2x) moved to the category of DD genes.
+    my %dd_genes = map {$_=>1} grep {chomp} $self->cmd("zcat $$self{dd_genes} | cut -f4");
+
+    # list of genes with a de novo protein truncating variant
+    my %ptv_genes = ();
+    for my $line ($self->cmd(qq[cat $$self{dnm_ptvs}]))
+    {
+        if ( $line=~/^#/ ) { next; }
+        chomp($line);
+        my @col = split(/\t/,$line);
+        $ptv_genes{$col[0]} = $col[2];
+    }
+
+    my ($cols,$icds_genes);
+    open(my $fh,"zless $$self{clean_set} |") or $self->throw("zless $$self{clean_set}: $!");
+    while (my $line=<$fh>)
+    {
+        if ( $line=~/^#/ )
+        {
+            ($cols,$icds_genes) = $self->col_names({hdr=>$line},'cds_genes');
+            next;
+        }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+
+        my %genes = map {$_=>1} split(/,/,$col[$icds_genes]);
+        delete($genes{'.'});
+
+        # The callset is annotated with an older version, for example POU3F3 was not marked as a DD gene
+        # and HMGCS2 is not mono-allelic.
+        #
+        #   if ( $col[$indd_genes] ne '0' && !exists($dd_genes{$gene}) ) { $self->warn("not DD: $gene\n"); }
+        #   if ( $col[$indd_genes] eq '0' &&  exists($dd_genes{$gene}) ) { $self->warn("is DD: $gene\n"); }
+        #
+        #   if ( $col[$indd_genes] ne '0' ) { $$dd_gene{$gene}++; } # dd gene
+        #   else { $$nondd_gene{$gene}++; }                         # non-dd gene
+
+        my $single_gene = scalar keys %genes == 1 ? 1 : 0;
+        if ( $single_gene ) { $nsingle_gene_cnvs++; }
+        for my $gene (keys %genes)
+        {
+            $$multi_gene_cnvs{$gene}++;
+            if ( !$single_gene ) { next; }
+            if ( exists($dd_genes{$gene}) ) { $$dd_gene{$gene}++; }     # dd gene
+            else { $$nondd_gene{$gene}++; }                             # non-dd gene
+        }
+    }
+    close($fh) or $self->throw("close failed: zless $$self{clean_set}");
+
+    # how many recurrent single/mutli-gene CNV genes there are
+    for my $gene (keys %$multi_gene_cnvs) { if ( $$multi_gene_cnvs{$gene}==1 ) { delete($$multi_gene_cnvs{$gene}); } }
+    my $ndd = 0;
+    my $nnondd = 0;
+    my $nrecurrent_cnvs = 0;
+    for my $gene (keys %$dd_gene) { if ( $$dd_gene{$gene}>1 ) { $ndd++; $nrecurrent_cnvs += $$dd_gene{$gene}; } }
+    for my $gene (keys %$nondd_gene) { if ( $$nondd_gene{$gene}>1 ) { $nnondd++; $nrecurrent_cnvs += $$nondd_gene{$gene}; } }
+
+    open($fh,'>',"$dir/stats.txt") or $self->throw("$dir/stats.txt");
+    printf $fh "Number of recurrent genes affected by multi-gene CNVs:  %d\n", scalar keys %$multi_gene_cnvs;
+    printf $fh "Number of recurrent genes affected by single-gene CNVs: %d (%d DN-DD genes)\n", $ndd+$nnondd,$ndd;
+    printf $fh "Number of single-gene CNVs: %d\n", $nsingle_gene_cnvs;
+    printf $fh "Number of recurrent single-gene CNVs: %d\n", $nrecurrent_cnvs;
+    close($fh) or $self->throw("close failed: $dir/stats.txt");
+
+    open($fh,'>',"$dir/recurrent-genes.txt") or $self->throw("$dir/recurrent-genes.txt: $!");
+    my $dd = {};
+    my $nondd = {};
+    for my $gene (keys %$dd_gene)
+    {
+        print $fh "dd\t$$dd_gene{$gene}\t$gene\n";
+        my $n = $$dd_gene{$gene} > 4 ? 4 : $$dd_gene{$gene};
+        $$dd{$n}++;
+    }
+    for my $gene (keys %$nondd_gene)
+    {
+        print $fh "non-dd\t$$nondd_gene{$gene}\t$gene\n";
+        my $n = $$nondd_gene{$gene} > 4 ? 4 : $$nondd_gene{$gene};
+        $$nondd{$n}++;
+    }
+    close($fh) or $self->throw("close failed: $dir/recurrent-genes.txt");
+
+    open($fh,'>',"$dir/barplot.txt") or $self->throw("$dir/barplot.txt: $!");
+    for my $ncnv (keys %$dd)
+    {
+        my $lbl = $ncnv eq '4' ? '4+' : $ncnv;
+        print $fh "DD\t$lbl\t$$dd{$ncnv}\n";
+    }
+    for my $ncnv (keys %$nondd)
+    {
+        my $cat = "Non-DD";
+        if ( $ncnv > 1 ) { $cat = 'Recurrent-non-DD'; }
+        my $lbl = $ncnv eq '4' ? '4+' : $ncnv;
+        print $fh "$cat\t$lbl\t$$nondd{$ncnv}\n";
+    }
+    close($fh) or $self->throw("close failed: $dir/barplot.txt");
+
+    # $self->cmd(qq[cat $dir/barplot.txt | mplot barstack +type stack-xlbl-cnt -F -o $dir/recurrent-genes.png +xt 1,2,3,4+ +sty mine +cl '#D43F3A,#878787' +slb 'DD:DN-DD genes;Non-DD:Other genes' +la rotation=0,y=-0.02 +wh 5,4 +dpi 150 +hdt 1 +wd 0.6 +xl 'Gene recurrence' +yl 'Number of single-gene CNVs']); 
+
+    # list genes in each category
+    my $dat = {};
+    for my $recurrence (2,3,4)
+    {
+        for my $gene (sort {$b cmp $a} keys %$dd_gene)
+        {
+            if ( $$dd_gene{$gene} > 4 ) { $$dd_gene{$gene} = 4; }
+            if ( $$dd_gene{$gene}!=$recurrence ) { next; }
+            my $num = sprintf("/%d",exists($ptv_genes{$gene}) ? $ptv_genes{$gene} : 0);
+            push @{$$dat{$recurrence}{dd}},"$gene  $num";
+        }
+        for my $gene (sort {$b cmp $a} keys %$nondd_gene)
+        {
+            if ( $$nondd_gene{$gene} > 4 ) { $$nondd_gene{$gene} = 4; }
+            if ( $$nondd_gene{$gene}!=$recurrence ) { next; }
+            my $num = sprintf("/%d",exists($ptv_genes{$gene}) ? $ptv_genes{$gene} : 0);
+            push @{$$dat{$recurrence}{nondd}},"$gene  $num";
+        }
+    }
+
+    my $rec_2_ndd = join("','",@{$$dat{2}{nondd}});
+    my $rec_2_dd  = join("','",@{$$dat{2}{dd}});
+    my $rec_3_dd  = join("','",@{$$dat{3}{dd}});
+    my $rec_3_ndd = join("','",@{$$dat{3}{nondd}});
+    my $rec_4_dd  = join("','",@{$$dat{4}{dd}});
+
+    open($fh,'>',"$dir/recurrent-genes.py") or $self->throw("$dir/recurrent-genes.py: $!");
+    tprint($fh, qq[
+        #!/usr/bin/env python3
+
+        import matplotlib as mpl
+        mpl.use('Agg')
+        import matplotlib.pyplot as plt
+        import itertools
+        import csv,re
+        csv.register_dialect('tab', delimiter='\\t', quoting=csv.QUOTE_NONE)
+
+        labels = []
+        files = ['$dir/barplot.txt']
+        type = 'stack-xlbl-cnt'
+
+        barstacks   = []        # defines the order of the stacks
+        stack_label = None      # +slb 'stack1:Deletions;stack2:Duplications'           # stack labels
+        stack_label = 'DD:DN-DD genes;Recurrent-non-DD:Recurrent\\nnon DN-DD\\ngenes;Non-DD:Other genes'
+        if stack_label!=None:
+            tmp = stack_label
+            stack_label = []
+            barstacks   = []
+            for x in tmp.split(';'):
+                y = x.split(':')
+                if len(y)!=2: 
+                    import sys
+                    print('Could not parse "%s", expected colon-delimited stack:label\\n' % x)
+                    sys.exit(1)
+                st = y[0]
+                lb = y[1]
+                barstacks.append(st)
+                stack_label.append(lb)
+
+        xlbl2xval = {}
+        xticks = '1,2,3,4+'
+        tmp = xticks.split(',')
+        for i in range(len(tmp)): xlbl2xval[tmp[i]] = i
+
+        dat = {}
+        max_len = 0
+        for i in range(len(files)):
+            file = open(files[i],'r')
+            for line in file:
+                row = line.rstrip('\\n').split('\\t')
+                if row[0][0] == '#': continue
+                stack = row[0]
+                xlbl  = row[1]
+                cnt   = float(row[2])
+                if xlbl not in xlbl2xval:
+                    xlbl2xval[xlbl] = len(xlbl2xval)
+                xval = xlbl2xval[xlbl]
+                if stack not in dat:
+                    dat[stack] = {}
+                    dat[stack]['xval'] = []
+                    dat[stack]['yval'] = []
+                dat[stack]['xval'] +=  [0] * (xval+1-len(dat[stack]['xval']))
+                dat[stack]['yval'] +=  [0] * (xval+1-len(dat[stack]['yval']))
+                dat[stack]['xval'][xval] = xval
+                dat[stack]['yval'][xval] = cnt
+                if stack not in barstacks: barstacks.append(stack)
+                if max_len < len(dat[stack]['xval']): max_len = len(dat[stack]['xval'])
+        
+        xlbl = [''] * max_len
+        for lbl in xlbl2xval: xlbl[xlbl2xval[lbl]] = lbl
+        
+        for stack in dat:
+            dat[stack]['xval'] = range(max_len)
+            dat[stack]['xlbl'] = xlbl
+            dat[stack]['yval'] +=  [0] * (max_len-len(dat[stack]['yval']))
+        
+        wh = 4.3,4.5
+        wd = 0.8
+        sp = 0  # Small space between bars as fraction of wd; +sp 0.1
+        colors = '#f4640d,#00b7ed,#878787'
+        colors = colors.split(',')
+        lbl_args = {'rotation':0,'y':-0.02}
+        plt_args = {}
+        
+        fig, ax1 = plt.subplots(1, 1, figsize=wh)
+        for i in range(len(barstacks)): 
+            bardat = dat[barstacks[i]]
+            plt_args['color'] = colors[i%len(colors)]
+        
+            plt_args['linewidth'] = 0
+            if stack_label!=None:
+                plt_args['label'] = stack_label[i]
+        
+            xdat = [x-wd*0.5 for x in bardat['xval']]
+            if i==0:
+                bardat['ytop'] = bardat['yval']
+            else:
+                bardat['bottom'] = dat[barstacks[i-1]]['ytop']
+                bardat['ytop']   = []
+                for j in range(len(bardat['bottom'])):
+                    bardat['ytop'].append( bardat['bottom'][j] + bardat['yval'][j] )
+                plt_args['bottom'] = bardat['bottom']
+            ydat = bardat['yval']
+            ax1.bar(xdat,ydat,wd,**plt_args)
+
+        dy  = 4
+        dy2 = 4.5
+        rec = [
+            {
+                'txt': ['$rec_2_dd'],
+                'col': colors[0],
+                'x'  : 1-wd, 
+                'y'  : dat['Non-DD']['ytop'][1] + dy,
+            },
+            {
+                'txt': ['$rec_2_ndd'],
+                'col': colors[1],
+                'x'  : 1-wd, 
+                'y'  : dat['Non-DD']['ytop'][1] + dy + dy2*len(['$rec_2_dd']) + dy*0.5,
+            },
+            {
+                'txt': ['$rec_3_dd'],
+                'col': colors[0],
+                'x'  : 2-wd, 
+                'y'  : dat['Non-DD']['ytop'][2] + dy,
+            },
+            {
+                'txt': ['$rec_3_ndd'],
+                'col': colors[1],
+                'x'  : 2-wd, 
+                'y'  : dat['Non-DD']['ytop'][2] + dy + dy2*len(['$rec_3_dd']) + dy*0.5,
+            },
+            {
+                'txt': ['$rec_4_dd'],
+                'col': colors[0],
+                'x'  : 3-wd, 
+                'y'  : dat['Non-DD']['ytop'][3] + dy,
+            },
+        ]
+        for col in rec:
+            for i in range(len(col['txt'])):
+                y = col['y'] + i*dy2
+                x = col['x'] 
+                txt = ax1.annotate(col['txt'][i],xy=(x,y),xycoords='data',textcoords='data',fontsize=9,ha='left',va='bottom',color=col['col'],style='italic',fontweight='bold')
+
+        ax1.set_xticks([x-wd*0.5 for x in dat[barstacks[0]]['xval']])
+        ax1.set_xticklabels(dat[barstacks[0]]['xlbl'],**lbl_args)
+        
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.get_xaxis().tick_bottom()
+        ax1.get_yaxis().tick_left()
+        ax1.spines['bottom'].set_color('grey')
+        ax1.spines['left'].set_color('grey')
+        mpl.rcParams['text.color'] = '555555'
+        ax1.patch.set_visible(False)
+        
+        ax1.xaxis.set_tick_params(length=0)
+        #ylabel = 'Number of single-gene CNVs'
+        #if ylabel!=None: ax1.set_ylabel(ylabel)
+        #xlabel = 'Gene recurrence'
+        #if xlabel!=None: ax1.set_xlabel(xlabel)
+        
+        plt.subplots_adjust(bottom=0.08,left=0.09,right=0.99,top=0.98)
+        plt.legend(numpoints=1,markerscale=1,loc=(0.65,0.75),prop={'size':9},frameon=False)
+        plt.savefig('$dir/recurrent-genes.png',dpi=150)
+        plt.savefig('$dir/recurrent-genes.svgz')
+        plt.close()
+    ]);
+    close($fh) or $self->throw("close failed: $dir/recurrent-genes.py");
+    $self->cmd("python3 $dir/recurrent-genes.py");
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+# Determine partial/entire DD gene deletions/duplications according to ACMG guidelines
+#   https://www.nature.com/articles/s41436-019-0686-8
+sub loss_of_function
+{
+    my ($self,$outfile,$infile) = @_;
+
+    my $inc_dsg_gene = { map { $_=>1 } grep {chomp} $self->cmd("cat $$self{inc_dsg} | cut -f4") };
+
+    # this is to determine partial/entire event
+    my $gene2nexon = {};
+    open(my $in,"gunzip -c $$self{ddg2p_genes} |") or $self->throw("gunzip -c $$self{ddg2p_genes}: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[-1] ne '.' ) { $$gene2nexon{$col[-1]}++; }
+    }
+    close($in) or $self->throw("close failed: gunzip -c $$self{ddg2p_genes}");
+
+    my ($cols,$itype,$incds,$idd) = $self->col_names($infile,'type','ncds_genes','dd_genes');
+    my $ncol = 1 + scalar keys %$cols;
+    my $cmd = qq[gunzip -c $$self{ddg2p_genes} | annot-regs -d $infile -c 1,2,3:chr,beg,end -t 4:LoF --allow-dups];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    open(my $out,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ )
+        {
+            print $out $line;
+            next;
+        }
+        chomp($line);
+        my @col = split(/\t/,$line);
+        my $ncds = $col[$incds];
+        my $lof_score = 0;
+        my $ddgp_genes = {}; # NB: these are only DDG2P genes, not all genes!
+        for my $gene (split(/,/,$col[-1]))
+        {
+            if ( $gene eq '.' ) { next; }
+            $$ddgp_genes{$gene}++;
+        }
+        if ( $col[$itype] eq 'DUP' )
+        {
+            for my $gene (keys %$ddgp_genes)
+            {
+                # entire gene DUP && sensitivie to gene dosage: this category does not add anything
+                if ( $gene ne '.' && $$gene2nexon{$gene} == $$ddgp_genes{$gene} && exists($$inc_dsg_gene{$gene}) ) { $lof_score = 1; last; }
+            }
+            if ( $ncds >= 35 && $ncds <= 49 ) { $lof_score += 0.45; }
+            if ( $ncds >= 50 ) { $lof_score += 0.9; }
+        }
+        elsif ( $col[$itype] eq 'DEL' )
+        {
+            if ( scalar keys %$ddgp_genes ) { $lof_score = 1; }
+            if ( $ncds >= 25 && $ncds <= 34 ) { $lof_score += 0.45; }
+            if ( $ncds >= 35 ) { $lof_score += 0.9; }
+        }
+        $col[-1] = $lof_score > 1 ? 1 : $lof_score;
+        $col[$idd] = scalar keys %$ddgp_genes ? join(',',sort keys %$ddgp_genes) : '.';
+        print $out join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: $outfile.part");
+
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub decipher_report
+{
+    my ($self,$outfile,$infile) = @_;
+
+    if ( !($outfile=~/\.txt$/) ) { $self->throw("Unexpected output file name: $outfile\n"); }
+    my $outfile_all   = $`.'.all.txt';
+
+    my %smpl2decipher_id = ();
+    for my $line ($self->cmd(qq[cat $infile | awk '{OFS="\\t"}{print \$5,\$5}' | ../rename-ddd-samples -c 2 -t decipher_id]))
+    {
+        chomp($line);
+        my ($id1,$id2) = split(/\t/,$line);
+        $smpl2decipher_id{$id1} = $id2;
+    }
+
+    my ($cols) = $self->col_names($infile);
+    my @hdr  = qw(smpl decipher_id type chr beg end length is_in_decipher decipher_pathogenicity in_parents in_DGV TCR_Ig include_in_paper called_by n_DD_genes(CDS) n_all_genes(CDS) dd_genes(CDS) all_genes(CDS) l2r_mean cbrowse decipher);
+    my %icol = ();
+    for (my $i=0; $i<@hdr; $i++)
+    {
+        $icol{$hdr[$i]} = $i;
+        $hdr[$i] = sprintf "[%d]%s",$i+1,$hdr[$i];
+    }
+
+    my $cmd =
+        qq[cat $infile | rename-ddd-samples -t decipher_id -c 5 -i -1:decipher_id | ] .
+        qq[ annot-regs -s $$self{decipher} -c chr,start,end:chr,beg,end -m patient_id:decipher_id -t pathogenicity,created:decipher_pathogenic,in_decipher | ] .
+        qq[ annot-regs -s $$self{dgv_cnvs} -c chr,beg,end -ro 0.75 -t nobs:nDGV];
+    print STDERR "$cmd\n";
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+    my @lines = ();
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ )
+        {
+            $cols = $self->col_names({hdr=>$line});
+            next;
+        }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+
+        my $ndgv = 0;
+        for my $n (split(/,/,$col[$$cols{nDGV}])) { if ( $n=~/^(\d+)$/ ) { $ndgv += $n; } }
+
+        my $l2r = $col[$$cols{l2r_mean}];
+        if ( $l2r=~/,/ )
+        {
+            # there is a bug, some l2r_mean values are a list of values, take average
+            my $n = 0;
+            $l2r  = 0;
+            for my $val (split(',',$col[$$cols{l2r_mean}]))
+            {
+                $l2r += $val; 
+                $n++;
+            }
+            $l2r = sprintf("%.2f",$l2r/$n);
+        }
+        if ( $l2r eq '.' )
+        {
+            my $smpl_reg = "$col[$$cols{smpl}];$col[$$cols{chr}];$col[$$cols{beg}];$col[$$cols{end}]";
+            my @val = grep {chomp} $self->cmd(qq[../plot-l2r-trio '$smpl_reg' | cut -f3]);
+            if ( @val!=1 ) { $self->throw("No l2r values for $smpl_reg\n"); }
+            $l2r = $val[0];
+        }
+        my $length = $col[$$cols{end}]-$col[$$cols{beg}];
+
+        my %genes = $col[$$cols{dd_genes}] eq '.' ? () : map {$_=>1} split(/,/,$col[$$cols{dd_genes}]);
+        my $ncds_dd = scalar keys %genes;
+        my $cds_dd  = $ncds_dd ? join(',',sort keys %genes) : '.';
+
+        %genes = $col[$$cols{cds_genes}] eq '.' ? () : map {$_=>1} split(/,/,$col[$$cols{cds_genes}]);
+        my $ncds = scalar keys %genes;
+        my $cds  = $ncds ? join(',',sort keys %genes) : '.';
+
+        # this was used to update DECIPHER:
+        #   push @out,'GRCh37/hg19';
+        #   push @out,'De-novo-constitutive';
+        
+        my @out = ();
+        push @out,$col[$$cols{smpl}];
+        push @out,$smpl2decipher_id{$col[$$cols{smpl}]};
+        push @out,$col[$$cols{type}];
+        push @out,$col[$$cols{chr}];
+        push @out,$col[$$cols{beg}];
+        push @out,$col[$$cols{end}];
+        push @out,$length;
+        push @out,$col[$$cols{in_decipher}] eq '.' ? 0 : 1;
+        push @out,$col[$$cols{decipher_pathogenic}];
+        push @out,$col[$$cols{AF_parents}];
+        push @out,$ndgv;
+        push @out,$col[$$cols{filter}]=~/polyreg/ ? 1 : 0;
+        push @out,$col[$$cols{include_in_paper}];
+        push @out,$col[$$cols{called_by}];
+        push @out,$ncds_dd;
+        push @out,$ncds;
+        push @out,$cds_dd;
+        push @out,$cds;
+        push @out,$l2r;
+        push @out,sprintf("=HYPERLINK(\"http://ddd-view.dev.sanger.ac.uk/index.html?%s;%s;%s;%s\")",$col[$$cols{smpl}],$col[$$cols{chr}],$col[$$cols{beg}],$col[$$cols{end}]);
+        push @out,sprintf("=HYPERLINK(\"https://decipher.sanger.ac.uk/patient/%s\")",$smpl2decipher_id{$col[$$cols{smpl}]});
+        push @lines,\@out;
+    }
+
+    my @slines = sort
+    {
+        if ( $$a[$icol{is_in_decipher}] < $$b[$icol{is_in_decipher}] ) { return -1; }
+        if ( $$a[$icol{is_in_decipher}] > $$b[$icol{is_in_decipher}] ) { return 1; }
+        return $$b[$icol{length}]<=>$$a[$icol{length}];
+    } @lines;
+
+    open(my $out,'>',$outfile_all) or $self->throw("$outfile_all: $!");
+    print $out '#'.join("\t",@hdr)."\n";
+    for my $line (@slines)
+    {
+        print $out join("\t",@$line)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: $outfile_all");
+
+    rename("$outfile_all",$outfile) or $self->throw("rename $outfile_all $outfile: $!");
+}
+
+sub multi_entire_partial
+{
+    my ($self,$outdir,$infile) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    # gene list of monoallelic and x-linked DD genes
+    my %dd_gene = map {$_=>1} grep {chomp} $self->cmd("zcat $$self{dd_genes} | cut -f4");
+
+    # number of exons per gene
+    open(my $in,"zcat $$self{exons} |") or $self->throw("zcat $$self{exons}: $!");
+    my $gene2ncds = {};
+    while(my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        for my $gene (split(/,/,$col[-1])) { $$gene2ncds{$gene}++; }
+    }
+    close($in) or $self->throw("close failed: zcat $$self{exons}");
+
+    my $cols;
+    my $stat = {};
+
+    my $cmd = qq[annot-regs -s $$self{exons} -d $infile -c 1,2,3:chr,beg,end -t 4:exons --allow-dups];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $line=~/^#/ )
+        {
+            $cols = $self->col_names({hdr=>$line});
+            next;
+        }
+        my $dd  = 0;
+        my %cnt = ();
+        for my $gene (split(/,/,$col[$$cols{exons}]))
+        {
+            if ( $gene eq '.' ) { next; }
+            if ( exists($dd_gene{$gene}) ) { $dd = 1; }
+            $cnt{$gene}++;
+        }
+        if ( !scalar keys %cnt ) { print STDERR "No gene: $col[$$cols{type}] $col[$$cols{chr}]:$col[$$cols{beg}]-$col[$$cols{end}]\n"; next; }
+        my $multi  = scalar keys %cnt > 1 ? 1 : 0;
+        my $entire = 0;
+        if ( !$multi )
+        {
+            my $gene = (keys %cnt)[0];
+            $entire  = $cnt{$gene} == $$gene2ncds{$gene} ? 1 : 0;
+        }
+        my @key = ();
+        push @key, $col[$$cols{type}];
+        push @key, $dd ? 'DD' : 'other';
+        if ( $multi ) { push @key, 'multi'; }
+        elsif ( $entire ) { push @key, 'entire'; }
+        else { push @key, 'partial'; }
+        my $key = join("\t",@key);
+        $$stat{$key}++;
+    }
+    close($in) or $self->throw("close failed: $cmd");
+
+    my $fname = "$dir/dist.txt";
+    open(my $out,'>',$fname) or $self->throw("$fname: $!");
+    for my $key (sort keys %$stat)
+    {
+        print $out join("\t",$key,$$stat{$key})."\n";
+    }
+    close($out) or $self->throw("close failed: $fname");
+
+    $self->cmd(
+        qq[cat $fname | mplot bars-stacks -F -o $dir/multi-entire-partial.png,svgz,pdf +o 'DUP,DEL:DD,other' +dpi 150 ] .
+        qq[ +xt 'multi:Multiple\\ngenes,entire:Entire\\nsingle gene,partial:Partial\\nsingle gene'] .
+        qq[ +cl 'c=#007ab9,ec=black:c=#f4640d,ec=black:h=//,ec=black:-'] .
+        qq[ +lg 'Duplications:fc=#007ab9,ec=black;Deletions:fc=#f4640d,ec=black;DN-DD genes:fc=white,h=//,ec=black;Other genes:fc=white,ec=black' ] .
+        qq[ +sty mine +xta "rotation=0,y=-0.05" +wh 5,4 +adj bottom=0.18,left=0.14,right=0.99 +yl 'Count' +yla labelpad=10 +lga 'loc=(0.4\\,0.66)'] 
+    );
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+sub calls_in_decipher
+{
+    my ($self,$outfile,%args) = @_;
+    if ( !($outfile=~/\.txt$/) ) { $self->throw("could not parse: $outfile"); }
+    my $prefix = $`;
+    my $cmd = 
+        qq[cat $args{decipher} | rename-ddd-samples -c 2 -t person_stable_id | ] .
+        qq[ annot-regs -d $args{calls} -c chr,start,end:chr,beg,end -m patient_id:smpl -r -o 0.75 -t xxx_in_decipher_xxx];
+
+    $self->cmd(qq[$cmd | awk '\$line~/^#/ || !(\$line~/xxx_in_decipher_xxx/)' > $prefix.not.txt]);
+    $self->cmd(qq[$cmd | grep xxx_in_decipher_xxx > $outfile.part && mv $outfile.part $outfile]);
+}
+
+
+# CNV contributions to recessive disorders:
+# - find CNVs that hit a recessive (biallelic) DD gene and check if any has low-AF PTV
+sub recessive_cnvs
+{
+    my ($self,$outfile) = @_;
+
+    my %genes = ();
+    my @lines = $self->cmd(qq[zcat $$self{biallelic_genes}]);
+    for my $line (@lines)
+    {
+        chomp($line);
+        my ($chr,$beg,$end,$name) = split(/\t/,$line);
+        $genes{$name} = "$chr:$beg-$end";
+    }
+
+    my %severity =
+    (
+        "."                 => 0,
+        "intergenic"        => 1,
+        "upstream_gene"     => 1,
+        "downstream_gene"   => 1,
+        "intron"            => 2,
+        "non_coding_transcript_exon" => 2,
+        "nmd_transcript"    => 2,
+        "non_coding"        => 3,
+        "feature_elongation"    => 4,
+        "non_coding_transcript" => 4,
+        "tfbs_ablation"         => 4,
+        "tfbs_amplification"    => 4,
+        "regulatory_region" => 4,
+        "mature_mirna"      => 4,
+        "5_prime_utr"       => 4,
+        "3_prime_utr"       => 5,
+        "tf_binding_site"   => 5,
+        "stop_retained"     => 6,
+        "synonymous"        => 7,
+        "coding_sequence"   => 8,
+        "missense"          => 9,
+        "splice_region"     => 10,
+        "inframe_altering"  => 11,
+        "inframe_deletion"  => 12,
+        "inframe_insertion" => 13,
+        "splice_acceptor"   => 14,
+        "splice_donor"      => 15,
+        "stop_lost"         => 16,
+        "stop_gained"       => 17,
+        "start_lost"        => 18,
+        "frameshift"        => 19,
+        "feature_truncation"  => 19,
+        "transcript_ablation" => 19,
+        "transcript_amplification" => 19,
+    );
+
+    open(my $out,'>',"$outfile.part") or $self->throw("$outfile.part: $!");
+    my $cmd = qq[cat $$self{clean_set} | cut -f1-5 | annot-regs -c 1,2,3:chr,beg,end -t mono -s $$self{dd_genes} | annot-regs -c 1,2,3:chr,beg,end -t 4:bi -s $$self{biallelic_genes}];
+    print STDERR "$cmd\n";
+    open(my $fh,"$cmd |") or $self->throw("$cmd: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my @col = split(/\t/,$line);
+        if ( $col[-1] eq '.' ) { next; }
+        if ( $col[-2] ne '.' ) { next; }
+
+        my $smpl = $col[4];
+        my @vcf  = sort glob(join('/',$$self{uber_vcfs},substr($smpl,0,2),substr($smpl,2,2),substr($smpl,4,2),substr($smpl,6,2),substr($smpl,8,2),$smpl,'vcfs','*uber_maf_vep_tabix_qc.*.vcf.gz'));
+        my $vcf  = $vcf[-1];
+        my %ptvs = ();
+
+        for my $gene (split(/,/,$col[-1]))
+        {
+            if ( !exists($genes{$gene}) ) { $self->throw("Uh: $gene"); }
+            my $qry = qq[bcftools query -f'%CHROM:%POS\\t%REF\\t%ALT\\t%MAX_AF\\t%Consequence\\n' $vcf -r $genes{$gene} 2>/dev/null];     # drop undef header tags warnings
+            open(my $in,"$qry |") or $self->cmd("$qry: $!");
+            while (my $qry_line=<$in>)
+            {
+                chomp($qry_line);
+                my ($chrpos,$ref,$alt,$af,$csqs) = split(/\t/,$qry_line);
+                if ( $alt=~/^</ ) { next; }     # skip symbolic variants in VCFs, we are working with a more confident set
+                $csqs =~ s/[|&]/,/g;
+                for my $csq (split(/,/,$csqs))
+                {
+                    $csq =~ s/_variant//;
+                    $csq = lc($csq);
+                    if ( !exists($severity{$csq}) ) { $self->throw("What is the severity of '$csq'?\n\t$qry_line\n"); }
+                    if ( $severity{$csq} < $severity{splice_acceptor} ) { next; }
+                    $ptvs{"$chrpos-$af-$csq-$ref-$alt"} = 1;
+                }
+            }
+            close($in) or $self->throw("close failed: $qry");
+        }
+        if ( !scalar keys %ptvs ) { $ptvs{"."} = 1; }
+        print $out $line."\t".join(',',sort keys %ptvs)."\t$vcf\n";
+    }
+    close($fh) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+
+

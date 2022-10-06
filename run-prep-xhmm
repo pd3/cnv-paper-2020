@@ -1,0 +1,275 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use ddd_smpl;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose} = 1;
+    $$self{nsmpl_batch} = 300;
+    $$self{infiles} =
+    [
+        'DDD10k_XHMM_cifer_v3.txt.gz',
+        'DDD10k_XHMM_cifer_v5.txt.gz',
+    ];
+    $$self{annot_regs}    = 'annot-regs';
+    $$self{training_set}  = 'curated/stringent.txt.gz';
+    $$self{training_anns} = [qw(NUM_TARG Q_EXACT Q_SOME Q_NON_DIPLOID MEAN_RD)]; # proband_value proband_z_score)];
+    $$self{random_forest} = 'cnv-filter.py';
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-prep-xhmm\n" .
+        "Options:\n" .
+        "   -f, --infile <file>    Input files [".join(',',$$self{infiles})."]\n" .
+        "   -n, --nbatch <int>     Sample batch size [$$self{nsmpl_batch}]\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    $$self{smpl} = new ddd_smpl();
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    my @files = ();
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-n' or $arg eq '--nbatch' ) { $$self{nsmpl_batch}=shift(@ARGV); next; }
+        if ( $arg eq '-f' or $arg eq '--infile' ) { push @files,shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( @files ) { $$self{infiles} = \@files; }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    $self->spawn('merge_files',"$$self{outdir}/raw.txt.gz",$$self{infiles});
+    $self->wait;
+
+    $self->spawn('random_forest',"$$self{outdir}/random-forest");
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+sub merge_files
+{
+    my ($self,$outfile,$files) = @_;
+    my $hdr_printed = 0;
+    open(my $fh,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    for my $file (@$files)
+    {
+        my ($cols,$ichr,$ismpl) = $self->col_names($file,'CHR','SAMPLE');
+        open(my $in,"gunzip -c $file |") or $self->throw("gunzip -c $file: $!");
+        while (my $line=<$in>)
+        {
+            my @cols = split(/\t/,$line);
+            chomp($cols[-1]);
+            if ( $line=~/^#/ )
+            {
+                if ( $hdr_printed ) { next; }
+                $hdr_printed = 1;
+            }
+            else
+            {
+                my $smpl = $$self{smpl}->smpl2smpl($cols[$ismpl]);
+                if ( !defined $smpl ) { $self->warn("Unknown sample: $cols[$ismpl]\n"); next; }
+                $cols[$ismpl] = $smpl;
+                if ( $cols[$ichr] eq '23' ) { $cols[$ichr] = 'X'; }
+                elsif ( $cols[$ichr] eq '24' ) { $cols[$ichr] = 'Y'; }
+            }
+            print $fh join("\t",@cols)."\n";
+        }
+        close($in) or $self->throw("close failed: gunzip -c $file");
+    }
+    close($fh) or $self->throw("close failed: gzip -c > $outfile.part");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+sub random_forest
+{
+    my ($self,$outdir) = @_;
+    $self->cmd("mkdir -p $outdir.part");
+    my $dir = "$outdir.part";
+
+    my @common_cols = (qw(CNV CHR start end SAMPLE));
+    my ($cols,$itype,$ichr,$ibeg,$iend,$ismpl) = $self->col_names("$$self{outdir}/raw.txt.gz",@common_cols);
+
+    if ( !$self->is_finished("$dir/tmp.raw.gz.done") )
+    {
+        # Create a "chr,beg,end,type-smpl" file with raw calls. This is just to identify overlaps with the curated calls
+        #
+        open(my $out,"| gzip -c > $dir/tmp.raw.gz") or $self->throw("gzip -c > $dir/tmp.raw.gz: $!");
+        open(my $in,"gunzip -c $$self{outdir}/raw.txt.gz |")  or $self->throw("gunzip -c $$self{outdir}/raw.txt.gz: $!");
+        while (my $line=<$in>)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            print $out join("\t",$col[$ichr],$col[$ibeg],$col[$iend],"$col[$itype]-$col[$ismpl]")."\n";
+        }
+        close($in) or $self->throw("close failed: gunzip -c $$self{outdir}/raw.txt.gz");
+        close($out) or $self->throw("close failed: gzip -c > $dir/tmp.raw.gz");
+        $self->cmd("touch $dir/tmp.raw.gz.done");
+    }
+
+    if ( !$self->is_finished("$dir/all_del.gz.done") )
+    {
+        # Run annot-regs to identify overlaps, create the truth/fail training sets and the full set for filtering.
+        # Overlapping training calls will be identified from the added annotations such as TP-DEL-DDDXXXXXXXXXXXX
+        #
+        my $cmd = "$$self{annot_regs} -s $$self{training_set} -n -a . $dir/tmp.raw.gz";
+        open(my $in_ann,"$cmd |") or $self->throw("$cmd: $!");
+        open(my $in_raw,"gunzip -c $$self{outdir}/raw.txt.gz |") or $self->throw("gunzip -c $$self{outdir}/raw.txt.gz: $!");
+        open(my $out_truth_dup,"| gzip -c > $dir/train.truth_dup.gz") or $self->throw("gzip -c > $dir/train.truth_dup.gz: $!");
+        open(my $out_false_dup,"| gzip -c > $dir/train.false_dup.gz") or $self->throw("gzip -c > $dir/train.false_dup.gz: $!");
+        open(my $out_all_dup,"| gzip -c > $dir/all_dup.gz") or $self->throw("gzip -c > $dir/all_dup.gz: $!");
+        open(my $out_truth_del,"| gzip -c > $dir/train.truth_del.gz") or $self->throw("gzip -c > $dir/train.truth_del.gz: $!");
+        open(my $out_false_del,"| gzip -c > $dir/train.false_del.gz") or $self->throw("gzip -c > $dir/train.false_del.gz: $!");
+        open(my $out_all_del,"| gzip -c > $dir/all_del.gz") or $self->throw("gzip -c > $dir/all_del.gz: $!");
+        my @hdr = (@common_cols,@{$$self{training_anns}});
+        for my $fh (\*$out_truth_dup,\*$out_false_dup,\*$out_all_dup,\*$out_truth_del,\*$out_false_del,\*$out_all_del)
+        {
+            print {*$fh} "#".join("\t",@hdr)."\n";
+        }
+        while (1)
+        {
+            my $raw_line = <$in_raw>;
+            if ( defined $raw_line && $raw_line =~ /^#/ ) { next; }
+            my $ann_line = <$in_ann>;
+            if ( !defined $ann_line && !defined $raw_line ) { last; }
+            if ( !defined $ann_line || !defined $raw_line ) { $self->throw("Out of sync: $$self{outdir}/raw.txt.gz vs $cmd\n"); }
+            my @col = split(/\t/,$ann_line);
+            chomp($col[-1]);
+            my $smpl = $col[3];
+            my $anns = $col[4];
+            my $fh_train;
+            my $type;
+            if ( $smpl=~/^DUP-/ ) { $type = 'DUP'; $smpl = $'; }
+            elsif ( $smpl=~/^DEL-/ ) { $type = 'DEL'; $smpl = $'; }
+            else { $self->throw("Could not parse type: $ann_line\n"); }
+            for my $ann (split(/,/,$anns))
+            {
+                if ( $ann eq '.' ) { next; }
+                my $_smpl;
+                my $_type;
+                if ( $ann=~/^TP-DUP-/ ) { $fh_train = $out_truth_dup; $_smpl = $'; $_type = 'DUP'; }
+                elsif ( $ann=~/^TP-DEL-/ ) { $fh_train = $out_truth_del; $_smpl = $'; $_type = 'DEL'; }
+                elsif ( $ann=~/^FP-DUP-/ ) { $fh_train = $out_false_dup; $_smpl = $'; $_type = 'DUP'; }
+                elsif ( $ann=~/^FP-DEL-/ ) { $fh_train = $out_false_del; $_smpl = $'; $_type = 'DEL'; }
+                else { $self->throw("Could not parse tp-type [$ann]: $ann_line"); }
+                if ( $_type eq $type && $_smpl eq $smpl ) { last; }
+                $fh_train = undef;
+            }
+            my @raw_col = split(/\t/,$raw_line);
+            chomp($raw_col[-1]);
+            if ( $raw_col[$ichr] ne $col[0] or $raw_col[$ibeg] ne $col[1] or $raw_col[$iend] ne $col[2] or $raw_col[$ismpl] ne $smpl )
+            {
+                $self->throw("Out of sync:\n\t$raw_line\t$ann_line\n");
+            }
+
+            my @out;
+            for my $ann (@hdr)
+            {
+                if ( !exists($$cols{$ann}) or !exists($raw_col[$$cols{$ann}]) ) { $self->throw("No such column: $ann\n"); }
+                push @out, $raw_col[$$cols{$ann}];
+            }
+            if ( defined $fh_train ) { print $fh_train join("\t",@out)."\n"; }
+
+            my $fh_all = $type eq 'DUP' ? $out_all_dup : $out_all_del;
+            print $fh_all join("\t",@out)."\n";
+        }
+        close($out_all_dup) or $self->throw("close failed: gzip -c > $dir/all_dup.gz");
+        close($out_truth_dup) or $self->throw("close failed: gzip -c > $dir/train.truth_dup.gz");
+        close($out_false_dup) or $self->throw("close failed: gzip -c > $dir/train.false_dup.gz");
+        close($out_all_del) or $self->throw("close failed: gzip -c > $dir/all_del.gz");
+        close($out_truth_del) or $self->throw("close failed: gzip -c > $dir/train.truth_del.gz");
+        close($out_false_del) or $self->throw("close failed: gzip -c > $dir/train.false_del.gz");
+        close($in_raw) or $self->throw("close failed: gunzip -c $$self{outdir}/raw.txt.gz");
+        close($in_ann) or $self->throw("close failed: $cmd");
+        $self->cmd("touch $dir/all_del.gz.done");
+    }
+
+    my $metrics = join(',',@{$$self{training_anns}});
+    $self->cmd("$$self{random_forest} -f $dir/train.false_dup.gz -t $dir/train.truth_dup.gz -r $dir/all_dup.gz -m $metrics -o $dir/scored.dup.txt.gz -l $dir/scored.dup.txt.gz.log");
+    $self->cmd("$$self{random_forest} -f $dir/train.false_del.gz -t $dir/train.truth_del.gz -r $dir/all_del.gz -m $metrics -o $dir/scored.del.txt.gz -l $dir/scored.del.txt.gz.log");
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+

@@ -1,0 +1,781 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+use FindBin;
+use lib "$FindBin::Bin";
+use ddd_smpl;
+use TabixCache;
+
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose} = 1;
+    $$self{indir}        = 'learn';
+    $$self{trio_samples} = 'ddd-samples.ped';
+    $$self{samples}      = 'bams-baits-smpl-sex.nodup.txt';     # bam,bait,smpl,sex  (sex is unused)
+    $$self{curated}      = 'curated.paper/curated.stringent.txt.gz';
+    $$self{known_bad}    = 'curated.paper/curated.bad.txt.gz';
+    $$self{known_inh}    = 'curated.paper/curated.inh.txt.gz';
+    $$self{annot_regs}   = 'annot-regs';
+    $$self{in_the_list}  = 'is-in-the-list';
+    $$self{raw_decipher} = 'decipher/decipher.raw.txt.gz';
+    $$self{'1000gp'}     = '1000gp/cnvs.txt.gz';
+    $$self{'dgv'}        = 'dgv/cnvs.txt.gz';
+    $$self{dd_genes}     = 'DDG2P.2020-10-29.mono.genes.CDS.merged.txt.gz';
+    $$self{cds_genes}    = 'Homo_sapiens.GRCh37.87.CDS-genes.1550074719.txt.gz';
+    $$self{callers}      = [qw(clamms convex xhmm canoes)];
+    $$self{phenotypes}   = 'phenotypes_and_patient_info.2017-12-15.txt.gz';
+    $$self{unaffected_parents} = 'unaffected_parent_stable_ids.txt';
+    $$self{morbidity_map}      = 'list.cnv-morbidity-genes.txt';
+    $$self{gff}                = 'Homo_sapiens.GRCh37.87.gff3.gz';
+    $$self{wes_acgh_trio_probands} = 'wes-acgh.trio.probands.txt';
+
+    # require reciprocal overlap for identification of:
+    #   - AF in parents
+    #   - AF in 1000GP
+    $$self{rolap} = 0.75;
+
+    $$self{sets} =
+    {
+        # 'good' => 
+        # [
+        #     '{RandomForestScore}>=0.97',
+        # ],
+        # 'fine-0.96' => 
+        # [
+        #     '{RandomForestScore}>=0.97 or ({RandomForestScore}>=0.96 && {number-of-probes}>=5)',
+        # ],
+        'fine-0.95' => 
+        [
+            '{RandomForestScore}>=0.97 or ({RandomForestScore}>=0.95 && {number-of-probes}>=5)',
+        ],
+    };
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .= 
+        "About: \n" .
+        "Usage: run-prep-learned\n" .
+        "Options:\n" .
+        "   -i, --indir <dir>      Expecting <dir>/random-forest/{DEL,DUP}.txt.gz input files [learn]\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    $$self{smpl} = new ddd_smpl();
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-i' or $arg eq '--indir' ) { $$self{indir} = shift(@ARGV); next; }
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir} = shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    $$self{del} = "$$self{indir}/random-forest/DEL.txt.gz";
+    $$self{dup} = "$$self{indir}/random-forest/DUP.txt.gz";
+
+    open(my $fh,'<',$$self{samples}) or $self->throw("$$self{samples}: $!");
+    while (my $line=<$fh>)
+    {
+        chomp($line);
+        my %rec;
+        @rec{qw(bam baits smpl sex)} = split(/\t/,$line);
+        if ( exists($$self{smpl2info}{$rec{smpl}}) ) { $self->warn("The sample \"$rec{smpl}\" is present twice in $$self{samples}\n"); next; }
+        $$self{smpl2info}{$rec{smpl}} = \%rec;
+    }
+    close($fh) or $self->throw("close failed: $$self{samples}");
+    $self->parse_ped($$self{trio_samples});
+    $self->parse_phenotypes($$self{phenotypes});
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    $self->spawn('strip_file',"$$self{outdir}/random-forest/scored.del.txt.gz",$$self{del});
+    $self->spawn('strip_file',"$$self{outdir}/random-forest/scored.dup.txt.gz",$$self{dup});
+    $self->wait;
+
+    if ( !$self->is_finished("$$self{outdir}/candidates.txt.gz") )
+    {
+        $self->cmd("cp $$self{indir}/candidates/candidates.txt.gz $$self{outdir}/candidates.txt.gz.part && mv $$self{outdir}/candidates.txt.gz.part $$self{outdir}/candidates.txt.gz")
+    }
+
+    # The cleaning consists of the following steps:
+    #   - remove everything not marked as DNM (check DNM status in curated file and l2r in parents)
+    #   - include only calls which pass the filtering expression (good:score>=0.98; very-good:score>=0.99 & nprobes>=5)
+    #   - remove all calls overlapping a curated TP call and then put back the curated TP call (this is to enforce curated boundaries)
+    #   - annotate with CNV frequency in parents
+    for my $set (keys %{$$self{sets}})
+    {
+        for my $type (qw(del dup))
+        {
+            $self->spawn('clean_set',"$$self{outdir}/for-analysis/$set/$type.txt.gz",$set,$$self{$type},uc($type));
+        }
+    }
+    $self->wait;
+
+    $self->set_limits(memory=>5_000);
+    for my $set (keys %{$$self{sets}})
+    {
+        for my $type (qw(del dup))
+        {
+            $self->spawn('annotate_calls',"$$self{outdir}/for-analysis/$set/$type.annot.txt.gz","$$self{outdir}/for-analysis/$set/$type.txt.gz");
+        }
+    }
+    $self->wait;
+    $self->set_limits(memory=>undef);
+
+    for my $set (keys %{$$self{sets}})
+    {
+        my $file = "$$self{outdir}/for-analysis/$set.annot.txt.gz";
+        if ( !$self->is_finished($file) )
+        {
+            $self->cmd("(zcat $$self{outdir}/for-analysis/$set/del.annot.txt.gz; zcat $$self{outdir}/for-analysis/$set/dup.annot.txt.gz | grep -v ^#) | gzip -c > $file.part");
+            rename("$file.part",$file) or $self->throw("rename $file.part $file: $!");
+
+        }
+    }
+
+    # Manually refine the list: remove Ig regions, multiallelic CNVs in general population, etc
+    for my $set (keys %{$$self{sets}})
+    {
+        $self->spawn('refine_list',"$$self{outdir}/refined.$set","$$self{outdir}/for-analysis/$set.annot.txt.gz");
+    }
+    $self->wait;
+
+    for my $set (keys %{$$self{sets}})
+    {
+        # This is a simplified set, anything what is called with a good random forest score is thought of as
+        # a good call, and we call this set "inherited CNVs". The aim is to show that these calls have low overlap
+        # with DN-DD genes, in contrast with true curated de novos. This is done only for the final set (hard-filter 0.95)
+        # and we ignore the number of probes: it does not change the final result and saves compute time.
+        my $cmd = 
+            qq[gunzip -c $$self{outdir}/random-forest/scored.{del,dup}.txt.gz | grep -v ^# | awk '\$6>=0.95' | gzip -c > $$self{outdir}/refined.$set/inherited.txt.gz.part] .
+            qq[ && mv $$self{outdir}/refined.$set/inherited.txt.gz.part $$self{outdir}/refined.$set/inherited.txt.gz];
+        $self->spawn('run_cmd',"$$self{outdir}/refined.$set/inherited.txt.gz",$cmd);
+
+        my $file = "$$self{outdir}/refined.$set/filtered.dups.txt";
+        if ( !$self->is_finished($file) )
+        {
+            $self->cmd(qq[cat $$self{outdir}/refined.$set/filtered.txt | awk '\$1=="DUP"' | cut -f2-5 > $file.part && mv $file.part $file]);
+        }
+        $file = "$$self{outdir}/refined.$set/filtered.dels.txt";
+        if ( !$self->is_finished($file) )
+        {
+            $self->cmd(qq[cat $$self{outdir}/refined.$set/filtered.txt | awk '\$1=="DEL"' | cut -f2-5 > $file.part && mv $file.part $file]);
+        }
+    }
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+
+sub annotate_calls
+{
+    my ($self,$outfile,$infile) = @_;
+
+    my $ii;
+    my $io = 1;
+
+    # First remove bad and inherited calls. We do it here to speed up the process after curation
+    my $xcols = $self->col_names($infile);
+    my $ncol  = scalar keys %$xcols;
+    my $ncol1 = $ncol + 1;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{known_bad} -d $infile -m sample:smpl -t bad | awk '{if(\$1~/^#/ || \$$ncol1==".")print \$line}' | cut -f1-$ncol | gzip -c > $outfile.part$io]); $ii = $io++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{known_inh} -d $outfile.part$ii -m sample:smpl -t bad | awk '{if(\$1~/^#/ || \$$ncol1==".")print \$line}' | cut -f1-$ncol | gzip -c > $outfile.part$io]); $ii = $io++;
+
+    # Add annotations, decipher, etc.
+    $self->cmd(qq[$$self{annot_regs} -s $$self{raw_decipher} -d $outfile.part$ii -m smpl -t 1,validated,pathogenic,feedback:decipher,decipher_validated,decipher_pathogenic,decipher_feedback | gzip -c > $outfile.part$io]); $ii = $io++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{'1000gp'} -d $outfile.part$ii -c 1,2,3:chr,beg,end -t 5:AF_1000gp -ro $$self{rolap} | gzip -c > $outfile.part$io]); $ii = $io++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{dgv} -d $outfile.part$ii  -t nobs:AF_dgv -ro $$self{rolap} | gzip -c > $outfile.part$io]); $ii = $io++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{dd_genes} -d $outfile.part$ii -c 1,2,3:chr,beg,end -t 4:dd_genes | gzip -c > $outfile.part$io]); $ii = $io++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{cds_genes} -d $outfile.part$ii -c 1,2,3:chr,beg,end -t 4:cds_genes | gzip -c > $outfile.part$io]); $ii = $io++;
+
+    # Coding exons overlapped by the CNV
+    $self->cmd(qq[gunzip -c $$self{gff} | grep -v ^# | awk '\$3=="CDS"' | cut -f1,4,5 | sort -k1,1d -k2,2n -k3,3n | uniq | gzip -c > $outfile.cds.gz]);
+    $self->cmd(qq[$$self{annot_regs} -s $outfile.cds.gz -d $outfile.part$ii -c 1,2,3:chr,beg,end -t cds:nexons --allow-dups | gzip -c > $outfile.part$io]); $ii = $io++;
+    my (undef,$inexons) = $self->col_names("$outfile.part$ii",qw(nexons));
+    open(my $in,"gunzip -c $outfile.part$ii |") or $self->throw("gunzip -c $outfile.part$ii: $!");
+    open(my $out,"| gzip -c > $outfile.part$io") or $self->throw("gzip -c > $outfile.part$io: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/) { print $out $line; next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $n = $col[$inexons] eq '.' ? 0 : scalar split(/,/,$col[$inexons]);
+        $col[$inexons] = $n;
+        print $out join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $outfile.part$ii");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part$io");
+    $ii = $io++;
+
+    my $callers_str = join(',',@{$$self{callers}});     # clamms,convex,xhmm,canoes
+    $self->cmd(qq[$$self{annot_regs} -s $$self{indir}/features.txt.gz -d $outfile.part$ii -m smpl,type -t l2r_mean,$callers_str | gzip -c > $outfile.part$io]); $ii = $io++;
+
+    my ($cols,$ichr,$ibeg,$iend,$ismpl,$idd_genes,$icds_genes,$iaf_dgv,@icallers) = $self->col_names("$outfile.part$ii",qw(chr beg end smpl dd_genes cds_genes AF_dgv),@{$$self{callers}});
+    my @hdr = sort { $$cols{$a}<=>$$cols{$b} } keys %$cols;
+    my $ncallers = scalar @{$$self{callers}};
+    push @hdr,"called_by","ndd_genes","ncds_genes","array_previously_done","cbrowse";
+
+    open($in,"gunzip -c $outfile.part$ii |") or $self->throw("gunzip -c $outfile.part$ii: $!");
+    open($out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    print $out '#'.join("\t",@hdr)."\n";
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+
+        # Fix DGV frequency - sum up
+        my $ndgv = 0;
+        for my $dgv (split(/,/,$col[$iaf_dgv]))
+        {
+            if ( $dgv ne '.' ) { $ndgv += $dgv; }
+        }
+        if ( $col[$iaf_dgv] ne '.' ) { $col[$iaf_dgv] = $ndgv; }
+
+        # Add the new columns:
+        # - called_by
+        my @called_by = ();
+        for (my $i=0; $i<@icallers; $i++)
+        {
+            my $idx = $icallers[$i];
+            if ( $col[$idx] ne '.' && $col[$idx] ne '0' ) { push @called_by,$$self{callers}[$i]; }
+        }
+        if ( !@called_by ) { push @called_by,'.'; }
+        push @col,join(',',@called_by);
+
+        # - ndd_genes
+        my @genes = split(/,/,$col[$idd_genes]);
+        my $n = $col[$idd_genes] eq '.' ? 0 : scalar @genes;
+        push @col,$n;
+
+        # - ncds_genes
+        @genes = split(/,/,$col[$icds_genes]);
+        $n = $col[$icds_genes] eq '.' ? 0 : scalar @genes;
+        push @col,$n;
+
+        # - array_previously_done
+        push @col, exists($$self{smpl2array_done}{$col[$ismpl]}) ? $$self{smpl2array_done}{$col[$ismpl]} : '.';
+
+        # - cbrowse
+        push @col,"http://ddd-view.dev.sanger.ac.uk/index.html?$col[$ismpl];$col[$ichr];$col[$ibeg];$col[$iend]";
+
+        print $out join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $outfile.part$ii");
+    close($out) or $self->throw("close failed: gzip -c > $outfile.part");
+
+    #for my $i (1..6) { unlink("$outfile.part$i"); }
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub eval_expr
+{
+    my ($self,$cols,$line,$expr) = @_;
+    my $ori = $expr;
+    my $out = '';
+    while ( $expr=~/{([^}]+)}/ )
+    {
+        $out .= $`;
+        my $key = $1;
+        if ( !exists($$cols{$key}) ) { $self->throw("No such key \"$key\" in expression: $ori\n"); }
+        $out .= $$line[$$cols{$key}];
+        $expr = $';
+    }
+    $out .= $expr;
+    my $ret = eval "$out ? 1 : 0";
+    return $ret;
+}
+sub parse_ped
+{
+    my ($self,$file) = @_;
+    my %ped = ();
+    open(my $in,'<',$file) or $self->throw("$file: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\s+/,$line);
+        chomp($col[-1]);
+        if ( $col[2] eq '0' or $col[3] eq '0' ) { next; }
+        $$self{trio}{$col[1]}{father} = $col[2];
+        $$self{trio}{$col[1]}{mother} = $col[3];
+        $$self{parent}{$col[2]} = 1;
+        $$self{parent}{$col[3]} = 1;
+    }
+    close($in) or $self->throw("close failed: $file");
+
+    if ( !$self->is_finished("$$self{outdir}/unaffected-parents.txt") )
+    {
+        my %unaff = map {$_=>1} grep {chomp} $self->cmd(qq[cat $$self{unaffected_parents} | awk '{print \$1}']);
+
+        $self->cmd("mkdir -p $$self{outdir}");
+        open(my $fh,'>',"$$self{outdir}/unaffected-parents.txt.part") or $self->throw("$$self{outdir}/unaffected-parents.txt.part");
+        for my $parent (keys %{$$self{parent}})
+        {
+            if ( !exists($unaff{$parent}) ) { next; }
+            print $fh $parent."\n";
+        }
+        close($fh) or $self->throw("close failed: $$self{outdir}/unaffected-parents.txt.part");
+        rename("$$self{outdir}/unaffected-parents.txt.part","$$self{outdir}/unaffected-parents.txt") or $self->throw("rename $$self{outdir}/unaffected-parents.txt.part $$self{outdir}/unaffected-parents.txt: $!");
+    }
+
+    if ( !$self->is_finished("$$self{outdir}/probands.trio.txt") )
+    {
+        open(my $fh,'>',"$$self{outdir}/probands.trio.txt.part") or $self->throw("$$self{outdir}/probands.trio.txt.part");
+        for my $proband (keys %{$$self{trio}})
+        {
+            if ( !exists($$self{smpl2info}{$proband}) ) { next; }
+            print $fh $proband."\n";
+        }
+        close($fh) or $self->throw("close failed: $$self{outdir}/probands.trio.txt.part");
+        rename("$$self{outdir}/probands.trio.txt.part","$$self{outdir}/probands.trio.txt") or $self->throw("rename $$self{outdir}/probands.trio.txt.part $$self{outdir}/probands.trio.txt: $!");
+    }
+}
+sub calc_mean
+{
+    my ($vals) = @_;
+    if ( !@$vals ) { return 0; }
+    my $mean = 0;
+    for my $val (@$vals) { $mean += $val; }
+    $mean /= @$vals;
+    return $mean;
+}
+sub calc_dev
+{
+    my ($vals,$mean) = @_;
+    if ( !@$vals ) { return 0; }
+    my $dev2 = 0;
+    for my $val (@$vals) { $dev2 += ($val-$mean)**2; }
+    $dev2 /= @$vals;
+    return sqrt($dev2);
+}
+sub is_dnm
+{
+    my ($self,$cols,$line) = @_;
+    my $smpl = $$line[$$cols{smpl}];
+    my $chr  = $$line[$$cols{chr}];
+    my $beg  = $$line[$$cols{beg}];
+    my $end  = $$line[$$cols{end}];
+    my $key  = "$smpl-$chr";
+    if ( !exists($$self{trio}{$smpl}) ) { return 0; }
+    if ( !exists($$self{known_dnm}) )
+    {
+        my ($cols,$ichr,$ibeg,$iend,$ismpl,$idnm) = $self->col_names($$self{curated},qw(chr beg end sample DNM));
+        my @out = grep { chomp } $self->cmd("zcat $$self{curated}");
+        for my $line (@out)
+        {
+            if ( $line=~/^#/ ) { next; }
+            my @col = split(/\t/,$line);
+            my $_smpl = $col[$ismpl];
+            my $_chr  = $col[$ichr];
+            my $_beg  = $col[$ibeg];
+            my $_end  = $col[$iend];
+            my $_dnm  = $col[$idnm];
+            my $_key = "$_smpl-$_chr";
+            if ( $_dnm eq '.' ) { next; }
+            push @{$$self{known_dnm}{$_key}},[$_beg,$_end,$_dnm];
+        }
+    }
+    if ( exists($$self{known_dnm}{$key}) )
+    {
+        for my $reg (@{$$self{known_dnm}{$key}})
+        {
+            if ( $$reg[0] <= $end && $$reg[1] >= $beg ) { return $$reg[2]; }
+        }
+    }
+    else
+    {
+    }
+    if ( !exists($$self{tabix_l2r}) ) { $$self{tabix_l2r} = TabixCache->new(norm=>1,col=>3); }
+    if ( !exists($$self{smpl2info}{$smpl}{bam}) ) { $self->throw("No bam info for $smpl??\n"); }
+    my $l2r_file = $$self{smpl2info}{$smpl}{bam}.'.l2r.txt.gz';
+    my $vals = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$end);
+    if ( !@$vals ) { return 0; }   # this can happen for samples with aCGH-only data added by curation
+    my $l2r_mean = calc_mean($vals);
+    for my $parent ($$self{trio}{$smpl}{father},$$self{trio}{$smpl}{mother})
+    {
+        if ( !exists($$self{smpl2info}{$parent}{bam}) ) { $self->throw("No bam info for $smpl -> $parent??\n"); }
+        $l2r_file = $$self{smpl2info}{$parent}{bam}.'.l2r.txt.gz';
+        $vals = $$self{tabix_l2r}->get_entries(file=>$l2r_file,chr=>$chr,beg=>$beg,end=>$end);
+        if ( !@$vals ) { return 0; }   # this can happen for samples with aCGH-only data added by curation
+        my $mean = calc_mean($vals);
+        my $extr = abs($l2r_mean) > abs($mean) ? abs($l2r_mean) : abs($mean);
+        if ( abs($l2r_mean-$mean)/$extr < 0.5*$extr ) { return 0; }
+    }
+    return 1;
+}
+
+# clean sets:
+#   - remove if the call does not pass the filtering expression
+#   - remove if not marked as DNM
+#   - make sure the calls are real DNMs by checking the average L2R value in parents
+#   - put back all TP calls that may have been missed
+#   - annotate how often was a call observed in unaffected (and unrelated) parents
+#   - remove all known bad calls
+#
+sub clean_set
+{
+    my ($self,$outfile,$set,$infile,$type) = @_;
+    my $dir = "$outfile.part";
+    $self->cmd("mkdir -p $dir");
+
+    # Remove everything not marked as DNM and not passing the expression. 
+    my $iout = 1;
+    my ($cols,$ichr,$ibeg,$iend,$ismpl,$itype,$iqual,$idnm,$itp) = $self->col_names($infile,'chr','beg','end','smpl','type','RandomForestScore','DNM','tp/fp');
+    my $cmd = "$$self{annot_regs} -s $$self{curated} -d $infile -m sample:smpl -t DNM:is_dnm";
+    print STDERR "$cmd\n";
+    open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+    open(my $out,"| gzip -c > $dir/tmp$iout.txt.gz") or $self->throw("gzip -c > $dir/tmp$iout.txt.gz: $!");
+    print $out "#".join("\t",qw(type chr beg end smpl qual))."\n";
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $col[-1] eq '0' ) { next; }                    # marked as not DNM by curation
+        if ( $col[-1] ne '1' && !$col[$idnm] ) { next; }    # not marked as DNM by curation or by automatic recognition
+        if ( $col[$itp]=~/FP/ ) { next; }
+
+        my $pass = 0;
+        for my $expr (@{$$self{sets}{$set}})
+        {
+            if ( !$self->eval_expr($cols,\@col,$expr) ) { next; }
+            $pass = 1;
+            last;
+        }
+        if ( !$pass ) { next; }
+        print $out join("\t",$col[$itype],$col[$ichr],$col[$ibeg],$col[$iend],$col[$ismpl],$col[$iqual])."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: gzip -c > $dir/tmp$iout.txt.gz");
+    my $iin = $iout++;
+
+    # Put back all TP calls: first remove everything overlapping and then put them back
+    # so that their breakpoints are preserved
+    ($cols,$ichr,$ibeg,$iend,$itp,$itype,$ismpl) = $self->col_names($$self{curated},qw(chr beg end tp/fp type sample)); $ichr++;$ibeg++;$iend++;$itp++;$itype++;$ismpl++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{curated} -d $dir/tmp$iin.txt.gz -m sample:smpl -t known:known | awk '\$7!="known"' | cut -f1-6 | gzip -c > $dir/tmp$iout.txt.gz]);
+    $self->cmd(qq[zcat $$self{curated} | awk '{OFS="\\t"}{if(\$$itp=="TP" && \$$itype=="$type")print \$$itype,\$$ichr,\$$ibeg,\$$iend,\$$ismpl,2}' | gzip -c >> $dir/tmp$iout.txt.gz]);
+    $iin = $iout++;
+
+    # Put back all DECIPHER calls: first remove everything overlapping and the put them back
+    my $ival;
+    ($cols,$ichr,$ibeg,$iend,$itype,$ismpl,$ival) = $self->col_names($$self{raw_decipher},qw(chr beg end type smpl validated)); $ichr++;$ibeg++;$iend++;$itype++;$ismpl++;$ival++;
+    $self->cmd(qq[$$self{annot_regs} -s $$self{raw_decipher} -d $dir/tmp$iin.txt.gz -m smpl -t validated | awk 'NR==1 || \$NF=="."' | cut -f1-6 | gzip -c > $dir/tmp$iout.txt.gz]);
+    $self->cmd(qq[zcat $$self{raw_decipher} | grep -v ^# | awk '{OFS="\\t"}{if(\$$ival=="validated" && \$$itype=="$type")print \$$itype,\$$ichr,\$$ibeg,\$$iend,\$$ismpl,2}' | gzip -c >> $dir/tmp$iout.txt.gz]);
+    $iin = $iout++;
+
+    # CNV frequency in parents: prepare the file
+    my $raw_calls = "$$self{indir}/candidates/candidates.txt.gz";
+    $self->cmd(qq[zcat $raw_calls | $$self{in_the_list} -c 1 -l $$self{outdir}/unaffected-parents.txt | awk '\$5=="$type"' | gzip -c > $dir/unaffected-parents.txt.gz]);
+    $cmd = qq[$$self{annot_regs} -s $dir/unaffected-parents.txt.gz -d $dir/tmp$iin.txt.gz -c 2,3,4:chr,beg,end -t 1:AF_parents -ro $$self{rolap}];
+    print STDERR "$cmd\n";
+    open($in,"$cmd |") or $self->throw("$cmd: $!");
+    open($out,"| gzip -c > $dir/tmp$iout.txt.gz") or $self->throw("gzip -c > $dir/tmp$iout.txt.gz: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { print $out $line; next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $af = 0;
+        for my $smpl (split(/,/,$col[-1]))
+        {
+            if ( $smpl eq '.' ) { next; }
+            $af++;
+        }
+        pop(@col);
+        print $out join("\t",@col,$af)."\n";
+    }
+    close($in) or $self->throw("close failed: $cmd");
+    close($out) or $self->throw("close failed: gzip -c > $dir/tmp$iout.txt.gz");
+    $iin = $iout++;
+    
+    $cols = $self->col_names("$dir/tmp$iin.txt.gz");
+    open($in,"gunzip -c $dir/tmp$iin.txt.gz |") or $self->throw("gunzip -c $dir/tmp$iin.txt.gz: $!");
+    open($out,"| gzip -c > $dir/tmp$iout.txt.gz") or $self->throw("gzip -c > $dir/tmp$iout.txt.gz: $!");
+    while (my $line=<$in>)
+    {
+        if ( $line=~/^#/ ) { print $out $line; next; }
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $dnm = $self->is_dnm($cols,\@col);
+        if ( !$dnm ) { next; }
+        print $out $line;
+    }
+    close($in) or $self->throw("close failed: gunzip -c $dir/tmp$iin.txt.gz");
+    close($out) or $self->throw("close failed: gzip -c > $dir/tmp$iout.txt.gz");
+
+    rename("$dir/tmp$iout.txt.gz",$outfile) or $self->throw("rename $dir/tmp$iout.txt.gz $outfile: $!");
+}
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr;
+    if ( ref($file) eq 'HASH' )
+    {
+        if ( exists($$file{hdr}) ) { $hdr = $$file{hdr}; }
+        else { $self->throw("Incorrect usage\n"); }
+    }
+    if ( !defined $hdr ) { $hdr = (`zless $file | head -1`)[0]; }
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+sub strip_file
+{
+    my ($self,$outfile,$infile) = @_;
+
+    $self->cmd("cp $infile.log $outfile.log");
+
+    my (undef,$ichr,$ibeg,$iend,$ismpl,$itype,$iqual) = $self->col_names($infile,'chr','beg','end','smpl','type','RandomForestScore');
+    open(my $in,"gunzip -c $infile |") or $self->throw("gunzip -c $infile: $!");
+    open(my $out,"| gzip -c > $outfile.part") or $self->throw("gzip -c > $outfile.part: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $line=~/^#/ )
+        {
+            $col[0] =~ s/^#//;
+            for my $col (@col) { $col =~ s/\[\d+\]//g; }
+            $col[$itype] = '#'.$col[$itype];
+        }
+        #elsif ( $col[$iqual] < $$self{min_qual} ) { next; }
+        print $out join("\t",$col[$itype],$col[$ichr],$col[$ibeg],$col[$iend],$col[$ismpl],$col[$iqual])."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $infile");
+    close($out) or $self->throw("close failed: gzip -c > $outfile");
+    rename("$outfile.part",$outfile) or $self->throw("rename $outfile.part $outfile: $!");
+}
+
+sub parse_phenotypes
+{
+    my ($self,$file) = @_;
+    my ($cols,$ismpl,$iadone) = $self->col_names($file,qw(patient_id array_previously_done));
+    open(my $in,"gunzip -c $file |") or $self->throw("gunzip -c $file: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        my $done = $col[$iadone];
+        if ( $done eq 'Yes' ) { $done = 1; }
+        elsif ( $done eq 'No' ) { $done = 0; }
+        else { $done = '.'; }
+        $$self{smpl2array_done}{ $col[$ismpl] } = $done;
+    }
+    close($in) or $self->throw("close failed: gunzip -c $file");
+}
+
+
+sub filter_by_region
+{
+    my ($self,$infile,$filter,$key,$chr,$beg,$end) = @_;
+
+    if ( !exists($$self{cache}{$infile}) )
+    {
+        my (undef,$ichr,$ibeg,$iend) = $self->col_names($infile,qw(chr beg end)); $ichr++;$ibeg++;$iend++;
+        my @regs = grep { chomp } $self->cmd(qq[cat $infile | awk '{printf "%s\\t%s\\t%s\\n",\$$ichr,\$$ibeg,\$$iend}']);
+        for my $reg (@regs)
+        {
+            my ($_chr,$_beg,$_end) = split(/\t/,$reg);
+            push @{$$self{cache}{$infile}},{chr=>$_chr,beg=>$_beg,end=>$_end};
+        }
+    }
+    for my $reg (@{$$self{cache}{$infile}})
+    {
+        if ( $chr ne $$reg{chr} ) { next; }
+        if ( $beg > $$reg{end} ) { next; }
+        if ( $end < $$reg{beg} ) { next; }
+        if ( $beg >= $$reg{beg} && $end <= $$reg{end} ) { $$filter{$key} = 1; next; }
+        my $_beg = $beg > $$reg{beg} ? $beg : $$reg{beg};
+        my $_end = $end < $$reg{end} ? $end : $$reg{end};
+#if ($beg==195345412) { printf STDERR "%f .. $beg-$end vs $$reg{beg}-$$reg{end}\n",($_end-$_beg)/($end-$beg); }
+        if ( ($_end-$_beg)/($end-$beg) < 0.75 ) { next; }
+        $$filter{$key} = 1;
+    }
+}
+
+# Filters:
+#   1kG_AF
+#       - AF_1000gp >= 0.001
+#
+#   DGV200+
+#       - AF_dgv >= 200
+#
+#   DDD200+
+#       - AF_parents >= 200
+#
+#   polyreg (known polymorphic regions, at least 0.75 of the CNV in the region)
+#       - see the code for the list
+#
+#   decipher-syndrome (known decipher syndrome region)
+#       - see the code for the list
+#
+sub refine_list
+{
+    my ($self,$outdir,$infile) = @_;
+    if ( !($outdir=~m{/([^/]+)$}) ) { $self->throw("Could not parse: $outdir"); }
+    my $bname = $1;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my %morbidity = map {$_=>1} grep {chomp} $self->cmd(qq[cat $$self{morbidity_map} | cut -f1]);
+    my %acgh_wes_smpl = map {$_=>1} grep {chomp} $self->cmd(qq[cat $$self{wes_acgh_trio_probands} | cut -f1]);
+    my %wes_smpl      = map {$_=>1} grep {chomp} $self->cmd(qq[cat $$self{samples} | cut -f3]);
+
+    my (undef,$ismpl,$ichr,$ibeg,$iend,$iaf_ddd,$iaf_1kgp,$iaf_dgv,$icds) = $self->col_names($infile,qw(smpl chr beg end AF_parents AF_1000gp AF_dgv cds_genes));
+    open(my $in,"gunzip -c $infile |") or $self->throw("gunzip -c $infile: $!");
+    open(my $out,'>',"$dir/all.txt") or $self->throw("$dir/all.txt: $!");
+    while (my $line=<$in>)
+    {
+        my @col = split(/\t/,$line);
+        chomp($col[-1]);
+        if ( $line=~/^#/ )
+        {
+            $col[0] =~ s/^#//;
+            push @col,'aCGH_WES';
+            push @col,'morbidity';
+            push @col,'filter';
+            push @col,'include_in_paper';
+            for (my $i=0; $i<@col; $i++) { $col[$i] =~ s/\[\d+\]//g; $col[$i] = sprintf("[%d]%s",$i+1,$col[$i]); }
+            print $out '#'.join("\t",@col)."\n";
+            next;
+        }
+        my %filter = ();
+        my $include_in_paper = 1;
+
+        # Is the sample in both aCGH and WES?
+        my $acgh_wes = '.';
+        if ( exists($acgh_wes_smpl{$col[$ismpl]}) ) { $acgh_wes='aCGH,WES'; }
+        elsif ( exists($wes_smpl{$col[$ismpl]}) ) { $acgh_wes='WES'; }
+        else { $acgh_wes='aCGH'; }
+
+        # Filter by AF_1000gp frequency
+        for my $af (split(/,/,$col[$iaf_1kgp]))
+        {
+            if ( $af eq '.' ) { next; }
+            if ( !exists($filter{'1kG_AF'}) or $filter{'1kG_AF'} < $af ) { $filter{'1kG_AF'} = $af; }
+        }
+        if ( exists($filter{'1kG_AF'}) && $filter{'1kG_AF'} >= 0.01 ) { $include_in_paper = 0; }
+
+        # Filter by AF_dgv frequency
+        for my $af (split(/,/,$col[$iaf_dgv]))
+        {
+            if ( $af eq '.' ) { next; }
+            if ( !defined($filter{'DGV'}) or $filter{'DGV'}<$af ) { $filter{'DGV'} = $af; }
+        }
+        if ( exists($filter{'DGV'}) && $filter{'DGV'} >= 25 ) { $include_in_paper = 0; }
+
+        # Filter by AF_parents frequency
+        for my $af (split(/,/,$col[$iaf_ddd]))
+        {
+            if ( $af eq '.' ) { next; }
+            if ( !defined($filter{DDD}) or $filter{DDD} < $af ) { $filter{DDD} = $af; }
+        }
+        if ( exists($filter{'DDD'}) && $filter{'DDD'} >= 25 ) { $include_in_paper = 0; }
+
+        # Filter by region
+        $self->filter_by_region("$ENV{HOME}/wtxt/logs/sandbox/usr/ddd/list.Ig-and-TCR-loci.txt",\%filter,'polyreg',$col[$ichr],$col[$ibeg],$col[$iend]);
+        if ( exists($filter{polyreg}) ) { $include_in_paper = 0; }
+        if ( $col[$iend] - $col[$ibeg] >= 25e6 ) { $include_in_paper = 1; }
+
+        my @flt = ();
+        for my $key (sort keys %filter)
+        {
+            if ( $key eq 'polyreg' ) { push @flt,$key; next; }
+            push @flt,"$key=$filter{$key}";
+        }
+
+        # Morbidity map
+        my %morb = ();
+        for my $gene (split(/,/,$col[$icds]))
+        {
+            if ( exists($morbidity{$gene}) ) { $morb{$gene}=1; }
+        }
+        $self->filter_by_region("$ENV{HOME}/wtxt/logs/sandbox/usr/ddd/list.decipher-syndromes-loci.txt",\%morb,'decipher-syndrome',$col[$ichr],$col[$ibeg],$col[$iend]);
+
+        push @col, $acgh_wes;
+        push @col, keys %morb ? join(',',sort keys %morb) : '.';
+        push @col, @flt ? join(',',@flt) : '.';
+        push @col, $include_in_paper;
+        print $out join("\t",@col)."\n";
+    }
+    close($in) or $self->throw("close failed: gunzip -c $infile");
+    close($out) or $self->throw("close failed: $dir/all.txt");
+
+    my ($cols,$incl) = $self->col_names("$dir/all.txt",qw(include_in_paper)); $incl++;
+    $self->cmd(qq[cat $dir/all.txt | awk '\$line~/^#/ || \$$incl==1' > $dir/filtered.txt]);
+
+    rename($dir,$outdir) or $self->throw("rename $dir $outdir: $!");
+}
+
+
