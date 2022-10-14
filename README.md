@@ -15,6 +15,7 @@ run-prep-dgv
 run-prep-xhmm
 
 # The main random forest merging and filtering
+run-merge-cnvsets
 run-learn-cnvs
 random-forest.py
 run-prep-learned

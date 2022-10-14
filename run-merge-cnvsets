@@ -1,0 +1,301 @@
+#!/usr/bin/env perl
+#
+# Author: petr.danecek@sanger
+#
+
+use strict;
+use warnings;
+use Carp;
+
+my $runner = myRunner->new();
+$runner->run();
+
+exit;
+
+#--------------------------------
+
+package myRunner;
+use base qw(Runner);
+use strict;
+use warnings;
+
+sub new
+{
+    my ($class,@args) = @_;
+    my $self = $class->SUPER::new(@args);
+
+    $$self{verbose} = 1;
+    $$self{indirs} =
+    {
+        # key => dir
+        'canoes'     => './canoes',
+        'clamms'     => './clamms',
+        'cnsolidate' => './cnsolidate',
+        'convex'     => './convex',
+        'xhmm'       => './xhmm',
+    };
+    $$self{annot_regs} = 'annot-regs';
+
+    $$self{_sampleconf} = q[
+
+    ]."\n";
+
+    $$self{usage} .=
+        "About: \n" .
+        "Usage: run-merge-cnvsets\n" .
+        "Options:\n" .
+        "   -o, --outdir <dir>     Output directory\n" .
+        "\n";
+
+    return $self;
+}
+
+sub parse_args
+{
+    my ($self) = @_;
+    my @dirs = ();
+    while (defined(my $arg=shift(@ARGV)))
+    {
+        if ( $arg eq '-o' or $arg eq '--outdir' ) { $$self{outdir}=shift(@ARGV); next; }
+        $self->throw();
+    }
+    if ( !exists($$self{outdir}) ) { $self->throw("Expected the -o option."); }
+    if ( @dirs ) { $$self{indirs} = \@dirs; }
+}
+
+sub main
+{
+    my ($self) = @_;
+    $self->parse_args();
+    $self->save_config("config.txt");
+
+    # Create a union of regions across callsets but for each sample separately
+    $self->spawn('union',"$$self{outdir}/union");
+    $self->wait;
+
+    # Find overlaps
+    $self->overlaps("$$self{outdir}/overlap","$$self{outdir}/union");
+
+    # Create sets, not Venn-diagram like, but inclusive
+    $self->spawn('create_sets',"$$self{outdir}/sets","$$self{outdir}/overlap");
+    $self->wait;
+
+    # Create list of samples
+    $self->spawn('run_cmd',"$$self{outdir}/union.samples.txt","gunzip -c $$self{outdir}/union/union.*.txt.gz | cut -f4 | sort | uniq > $$self{outdir}/union.samples.txt.part && mv $$self{outdir}/union.samples.txt.part $$self{outdir}/union.samples.txt");
+    $self->spawn('run_cmd',"$$self{outdir}/sets.samples.txt","gunzip -c $$self{outdir}/sets/*.txt.gz | cut -f4 | sort | uniq > $$self{outdir}/sets.samples.txt.part && mv $$self{outdir}/sets.samples.txt.part $$self{outdir}/sets.samples.txt");
+    $self->wait;
+
+    $self->all_done;
+}
+
+sub save_config
+{
+    my ($self,$name) = @_;
+    my $src = $$self{_config} ? $$self{_config} : undef;
+    my $dst = "$$self{outdir}/$name";
+    if ( -e $dst && (!defined($src) or (stat($src))[9] <= (stat($dst))[9]) ) { return; }
+    if ( !-d $$self{outdir} ) { $self->cmd("mkdir -p $$self{outdir}"); }
+    open(my $fh,'>',$dst) or $self->throw("$dst: $!");
+    my $about = $$self{_about};
+    $about =~ s/\n/\n# /g;
+    print $fh "# $about";
+    close($fh);
+    if ( defined $src ) { $self->cmd("cat $src >> $dst"); }
+}
+
+sub col_names
+{
+    my ($self,$file,@names) = @_;
+    my $hdr = (`zless $file | head -1`)[0];
+    my @cols = split(/\t/,$hdr);
+    my %cols = ();
+    for (my $i=0; $i<@cols; $i++)
+    {
+        $cols[$i] =~ s/^#\s*//;
+        $cols[$i] =~ s/^\[.+\]\s*//;
+        chomp($cols[$i]);
+        $cols{$cols[$i]} = $i;
+    }
+    if ( @names )
+    {
+        my @out = ();
+        for my $name (@names)
+        {
+            if ( !exists($cols{$name}) ) { $self->throw("No such column in $file: $name\n"); }
+            push @out,$cols{$name};
+        }
+        return (\%cols,@out);
+    }
+    return \%cols;
+}
+
+sub union
+{
+    my ($self,$outdir) = @_;
+
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    for my $type (qw(del dup))
+    {
+        my @files = ();
+        for my $set (keys %{$$self{indirs}}) { push @files, "$$self{indirs}{$set}/random-forest/scored.$type.txt.gz"; }
+        my $cmd = 'gunzip -c '.join(" ",@files).' | grep -v ^# | cut -f2-5 | sort -k4,4d -k1,1d -k2,2n -k3,3n';
+        open(my $in,"$cmd |") or $self->throw("$cmd: $!");
+        open(my $out,"| gzip -c > $dir/union.$type.txt.gz") or $self->throw("gzip -c > $dir/union.$type.txt.gz: $!");
+        my $prev;
+        while (my $line=<$in>)
+        {
+            # 0:chr, 1:beg, 2:end, 3:smpl
+            my @col = split(/\t/,$line);
+            chomp($col[-1]);
+            if ( !defined $prev ) { $prev = \@col; next; }
+            if ( $$prev[3] eq $col[3] && $$prev[0] eq $col[0] && $$prev[2] >= $col[1] )
+            {
+                # the new record overlaps the previous
+                if ( $$prev[2] < $col[2] ) { $$prev[2] = $col[2]; }
+                next;
+            }
+            print $out join("\t",@$prev)."\n";
+            $prev = \@col;
+        }
+        if ( defined $prev ) { print $out join("\t",@$prev)."\n"; }
+        close($in) or $self->throw("close failed: $cmd");
+        close($out) or $self->throw("close failed: gzip -c > $dir/union.$type.txt.gz");
+    }
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+sub run_cmd
+{
+    my ($self,$outfile,$cmd) = @_;
+    $self->cmd($cmd);
+}
+sub overlaps
+{
+    my ($self,$outdir,$indir) = @_;
+
+    if ( $self->is_finished($outdir) ) { return; }
+
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my %files = ();
+    for my $type (qw(del dup))
+    {
+        for my $set (sort keys %{$$self{indirs}})
+        {
+            my $out = "$dir/rmme.$type.$set.txt.gz";
+            my @cmd = ();
+            push @cmd, qq[gunzip -c $$self{indirs}{$set}/random-forest/scored.$type.txt.gz | grep -v ^# | cut -f2-5 | gzip -c > $dir/$type.$set.txt.gz];
+            push @cmd, qq[$$self{annot_regs} -s $dir/$type.$set.txt.gz -a .,$set -nur $$self{outdir}/union/union.$type.txt.gz | gzip -c > $out.part];
+            push @cmd, qq[mv $out.part $out];
+            $self->spawn('run_cmd',$out,join(' && ',@cmd));
+            push @{$files{$type}}, $out;
+        }
+    }
+    $self->wait;
+
+    for my $type (qw(del dup))
+    {
+        open(my $out,"| gzip -c > $dir/overlap.$type.txt.gz") or $self->throw("gzip -c > $dir/overlap.$type.txt.gz: $!");
+        my @in = ();
+        for my $file (@{$files{$type}})
+        {
+            open(my $in,"gunzip -c $file |") or $self->throw("gunzip -c $file: $!");
+            push @in,$in;
+        }
+        while (1)
+        {
+            my @ann = ();
+            my $nundef = 0;
+            my ($chr,$beg,$end,$smpl,$ann);
+            for my $in (@in)
+            {
+                my $line = <$in>;
+                if ( !defined $line ) { $nundef++; next; }
+                my @col = split(/\t/,$line);
+                chomp($col[-1]);
+                if ( $col[-1] eq '.' ) { next; }
+                if ( !defined $chr ) { ($chr,$beg,$end,$smpl,$ann) = @col; }
+                if ( $chr ne $col[0] or $beg ne $col[1] or $end ne $col[2] or $smpl ne $col[3] ) { $self->throw("out of sync: $line"); }
+                push @ann,$col[-1];
+            }
+            if ( $nundef>0 && $nundef!=scalar @in ) { $self->throw("Out of sync!"); }
+            if ( $nundef ) { last; }
+            if ( !defined $chr ) { $self->throw("Should not happen!"); }
+            print $out join("\t",$chr,$beg,$end,$smpl,scalar @ann,join(',',@ann))."\n";
+        }
+        for (my $i=0; $i<@in; $i++)
+        {
+            close($in[$i]) or $self->throw("close failed: $files{$type}[$i]");
+        }
+        close($out) or $self->throw("close failed: gzip -c > $dir/overlap.$type.txt.gz");
+    }
+
+    for my $type (qw(del dup))
+    {
+        for my $file (@{$files{$type}}) { unlink($file); }
+    }
+
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+sub create_sets
+{
+    my ($self,$outdir,$indir) = @_;
+    my $dir = "$outdir.part";
+    $self->cmd("mkdir -p $dir");
+
+    my %vars = ();
+    my @sets = sort keys %{$$self{indirs}};
+    my $n = scalar @sets;
+    for (my $mask=3; $mask<=(1<<$n)-1; $mask++)
+    {
+        if ( ($mask && (($mask & $mask-1) == 0)) ) { next; } # only one bit is set in $mask, skip
+
+        my @key = ();
+        for (my $bit=0; $bit<$n; $bit++)
+        {
+            if ( (1<<$bit) & $mask ) { push @key,$sets[$bit]; }
+        }
+        my $key = join(',',@key);
+        $vars{$key}{mask} = $mask;
+    }
+    for my $key (keys %vars)
+    {
+        for my $tmp (keys %vars)
+        {
+            if ( ($vars{$key}{mask} & $vars{$tmp}{mask}) != $vars{$tmp}{mask} ) { next; }
+            push @{$vars{$key}{sets}},$tmp;
+        }
+    }
+    for my $type (qw(del dup))
+    {
+        my %fhs = ();
+        open(my $in,"gunzip -c $indir/overlap.$type.txt.gz |") or $self->throw("gunzip -c $indir/overlap.$type.txt.gz: $!");
+        while (my $line=<$in>)
+        {
+            my @col = split(/\t/,$line);
+            if ( $col[4]==1 ) { next; }
+            chomp($col[-1]);
+            for my $set (@{$vars{$col[5]}{sets}})
+            {
+                if ( !exists($fhs{$set}) )
+                {
+                    my $key = $set; $key =~ s/,/-/g;
+                    open(my $out,"| gzip -c > $dir/$type.$key.txt.gz") or $self->throw("gzip -c > $dir/overlap.$key.txt.gz: $!");
+                    $fhs{$set} = $out;
+                }
+                print {$fhs{$set}} $line;
+            }
+        }
+        close($in) or $self->throw("close failed: gunzip -c $dir/overlap.$type.txt.gz");
+        for my $set (keys %fhs)
+        {
+            my $key = $set; $key =~ s/,/-/g;
+            close($fhs{$set}) or $self->throw("close failed: gzip -c > $dir/$type.$key.txt.gz");
+        }
+    }
+    rename("$outdir.part",$outdir) or $self->throw("rename $outdir.part $outdir: $!");
+}
+
+
